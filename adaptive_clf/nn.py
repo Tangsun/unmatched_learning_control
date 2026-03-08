@@ -55,11 +55,13 @@ def apply_mlp(params: Dict[str, Any], x: Array, cfg: MLPConfig) -> Array:
     return cfg.output_scale * y
 
 
-def init_policy_params(key: Array, obs_dim: int, hidden_sizes: Tuple[int, ...] = (64, 64)) -> Dict[str, Any]:
+def init_policy_params(key: Array, obs_dim: int,
+                       hidden_sizes: Tuple[int, ...] = (64, 64),
+                       out_dim: int = 1) -> Dict[str, Any]:
     cfg = MLPConfig(
         in_dim=obs_dim,
         hidden_sizes=hidden_sizes,
-        out_dim=1,
+        out_dim=out_dim,
         activation="tanh",
         final_activation="identity",
         output_scale=1.0,
@@ -67,15 +69,30 @@ def init_policy_params(key: Array, obs_dim: int, hidden_sizes: Tuple[int, ...] =
     return init_mlp_params(key, cfg)
 
 
-def policy_apply(params: Dict[str, Any], obs: Array, u_min: float, u_max: float,
-                 hidden_sizes: Tuple[int, ...] = (64, 64)) -> Array:
+def policy_apply(params: Dict[str, Any], obs: Array,
+                 u_min: Any, u_max: Any,
+                 hidden_sizes: Tuple[int, ...] = (64, 64),
+                 out_dim: int = 1) -> Array:
+    """Apply policy network and map to control bounds.
+
+    u_min, u_max can be scalars (single-output) or arrays (multi-output).
+    For single-output (out_dim=1): returns scalar.
+    For multi-output: returns array of shape (out_dim,).
+    """
     cfg = MLPConfig(
         in_dim=obs.shape[-1],
         hidden_sizes=hidden_sizes,
-        out_dim=1,
+        out_dim=out_dim,
         activation="tanh",
         final_activation="identity",
         output_scale=1.0,
     )
-    raw = apply_mlp(params, obs, cfg).squeeze(-1)
-    return jnp.clip(u_max * jnp.tanh(raw), u_min, u_max)
+    raw = apply_mlp(params, obs, cfg)
+    u_min = jnp.asarray(u_min)
+    u_max = jnp.asarray(u_max)
+    u_mid = 0.5 * (u_max + u_min)
+    u_half = 0.5 * (u_max - u_min)
+    u = u_mid + u_half * jnp.tanh(raw)
+    if out_dim == 1:
+        return u.squeeze(-1)
+    return u

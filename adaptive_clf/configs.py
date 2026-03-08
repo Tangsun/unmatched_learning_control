@@ -22,8 +22,8 @@ class AcrobotParams:
     I2: float = 1 / 3
     g: float = 9.81
 
-    u_min: float = -10.0
-    u_max: float = 10.0
+    u_min: float = -100.0
+    u_max: float = 100.0
 
     a_min: float = 0.0
     a_max: float = 2.0
@@ -61,6 +61,7 @@ class AdaptiveConfig:
     radius_floor: float = 1e-3
     radius_scale: float = 1.0
     stopgrad_obs: bool = True
+    adapt_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -79,8 +80,8 @@ class RolloutConfig:
     Q_track: Tuple[Tuple[float, ...], ...] = (
         (10.0, 0.0, 0.0, 0.0),
         (0.0, 10.0, 0.0, 0.0),
-        (0.0, 0.0, 0.1, 0.0),
-        (0.0, 0.0, 0.0, 0.1),
+        (0.0, 0.0, 5.0, 0.0),
+        (0.0, 0.0, 0.0, 5.0),
     )
     Q_terminal_scale: float = 0.0
 
@@ -88,8 +89,46 @@ class RolloutConfig:
     R_proj: float = 1e-1
     R_infeasible: float = 50.0
 
+    R_energy: float = 0.0
+
     x_max: float = 10.0
-    u_clip: float = 50.0
+    u_clip: float = 100.0
+
+    n_substeps: int = 1
+    bptt_window: int = 0
+
+    lqr_blend: bool = False
+    lqr_V_threshold: float = 5.0
+    lqr_temperature: float = 1.0
+
+
+@dataclass(frozen=True)
+class CartPoleParams:
+    mc: float = 1.0
+    mp: float = 0.1
+    l: float = 0.5
+    g: float = 9.81
+
+    u_min: float = -10.0
+    u_max: float = 10.0
+
+    a_min: float = 0.0
+    a_max: float = 2.0
+
+    eps: float = 1e-8
+
+
+@dataclass(frozen=True)
+class DubinsParams:
+    v_ref: float = 1.0
+
+    v_min: float = 0.0
+    v_max: float = 2.0
+    omega_min: float = -2.0
+    omega_max: float = 2.0
+
+    a_min: float = -0.5
+    a_max: float = 0.5
 
 
 class AdaptiveState(NamedTuple):

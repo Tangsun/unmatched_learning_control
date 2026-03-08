@@ -33,13 +33,16 @@ from adaptive_clf.acrobot import (
     solve_lqr_P,
 )
 from adaptive_clf.nn import policy_apply
-from adaptive_clf.rollout import default_experiment_setup
+from adaptive_clf.rollout import default_experiment_setup, sample_uniform_batch
 from adaptive_clf.adaptive import init_adaptive_state, make_policy_observation
 
 
 def simulate_policy(policy_params, lyap_params, lyap_cfg, x0, p, dt, n_steps,
-                    a_true=0.0):
+                    a_true=0.0, K_lqr=None, P_lqr_blend=None,
+                    lqr_V_threshold=5.0, lqr_temperature=1.0):
     """Simulate a trained policy from x0, returning trajectories."""
+    from adaptive_clf.rollout import lqr_blend_control
+
     adapt_cfg = AdaptiveConfig()
     adaptive_state = init_adaptive_state(p, adapt_cfg)
     hidden_sizes = (64, 64)
@@ -51,6 +54,15 @@ def simulate_policy(policy_params, lyap_params, lyap_cfg, x0, p, dt, n_steps,
         obs = make_policy_observation(x, adaptive_state, adapt_cfg)
         u = policy_apply(policy_params, obs, p.u_min, p.u_max, hidden_sizes)
         u_clipped = jnp.clip(u, p.u_min, p.u_max)
+
+        if K_lqr is not None and P_lqr_blend is not None:
+            u_clipped = lqr_blend_control(
+                u_clipped, x, K_lqr, P_lqr_blend,
+                V_threshold=lqr_V_threshold,
+                temperature=lqr_temperature,
+                u_min=p.u_min, u_max=p.u_max,
+            )
+
         us.append(float(u_clipped))
         x = rk4_step(acrobot_dynamics_true, x, u_clipped, a_true_arr, dt, p)
         xs.append(np.array(x))
@@ -207,6 +219,9 @@ def main():
     parser.add_argument("--friction", type=float, default=0.0)
     parser.add_argument("--multi-ic", action="store_true",
                         help="Test from multiple initial conditions")
+    parser.add_argument("--sample-train-dist", type=int, default=0, metavar="N",
+                        help="Sample N initial conditions from training distribution (uniform)")
+    parser.add_argument("--eval-seed", type=int, default=123)
     args = parser.parse_args()
 
     p = AcrobotParams()
@@ -222,11 +237,58 @@ def main():
 
     Q_lqr = jnp.diag(jnp.array([40.0, 40.0, 8.0, 8.0]))
     R_lqr = jnp.array([[0.5]])
-    P_lqr, _ = solve_lqr_P(p, Q=Q_lqr, R=R_lqr, a_nom=0.0)
+    P_lqr, K_lqr = solve_lqr_P(p, Q=Q_lqr, R=R_lqr, a_nom=0.0)
     key = jax.random.PRNGKey(42)
     _, lyap_params, lyap_cfg = default_experiment_setup(key, p, P_lqr)
 
-    if args.multi_ic:
+    run_config_path = os.path.join(args.load_dir, "run_config.pkl")
+    blend_kwargs = {}
+    run_config = {}
+    if os.path.exists(run_config_path):
+        with open(run_config_path, "rb") as f:
+            run_config = pickle.load(f)
+        if run_config.get("lqr_blend", False):
+            K_saved = run_config.get("K_lqr", K_lqr)
+            P_saved = run_config.get("P_lqr", P_lqr)
+            blend_kwargs = {
+                "K_lqr": jnp.asarray(K_saved),
+                "P_lqr_blend": jnp.asarray(P_saved),
+                "lqr_V_threshold": run_config.get("lqr_V_threshold", 5.0),
+                "lqr_temperature": run_config.get("lqr_temperature", 1.0),
+            }
+            print(f"LQR blend enabled (V_thresh={blend_kwargs['lqr_V_threshold']:.1f})")
+
+    if args.sample_train_dist > 0:
+        n_eval = args.sample_train_dist
+        eval_key = jax.random.PRNGKey(args.eval_seed)
+        if os.path.exists(run_config_path) and "dq1_range" in run_config:
+            batch_x0, _ = sample_uniform_batch(
+                eval_key, n_eval, p,
+                dq1_range=run_config["dq1_range"],
+                dq2_range=run_config["dq2_range"],
+                w_range=run_config["w_range"],
+            )
+            print(f"Sampling {n_eval} ICs from training region "
+                  f"(scale={run_config['region_scale']}), seed={args.eval_seed}")
+        else:
+            batch_x0, _ = sample_uniform_batch(eval_key, n_eval, p)
+            print(f"Sampling {n_eval} ICs from full state space (no run_config), seed={args.eval_seed}")
+
+        all_results = []
+        for i in range(n_eval):
+            x0 = batch_x0[i]
+            label = (f"dq1={float(x0[0]):+.2f} dq2={float(x0[1]):+.2f} "
+                     f"w1={float(x0[2]):+.1f} w2={float(x0[3]):+.1f}")
+            xs, us = simulate_policy(policy_params, lyap_params, lyap_cfg,
+                                     x0, p, dt, n_steps, a_true=args.friction,
+                                     **blend_kwargs)
+            final_norm = np.linalg.norm(xs[-1])
+            print(f"  {label:45s}  |x_T| = {final_norm:.4f}")
+            all_results.append((label, xs, us))
+
+        save_path = os.path.join(args.load_dir, "eval_train_dist.png")
+        plot_multi_ic(all_results, dt, save_path)
+    elif args.multi_ic:
         ic_list = [
             ("upright +0.1",   jnp.array([0.1, 0.0, 0.0, 0.0])),
             ("upright +0.3",   jnp.array([0.3, 0.0, 0.0, 0.0])),
@@ -240,7 +302,8 @@ def main():
         all_results = []
         for label, x0 in ic_list:
             xs, us = simulate_policy(policy_params, lyap_params, lyap_cfg,
-                                     x0, p, dt, n_steps, a_true=args.friction)
+                                     x0, p, dt, n_steps, a_true=args.friction,
+                                     **blend_kwargs)
             final_norm = np.linalg.norm(xs[-1])
             print(f"  {label:20s}  |x_T| = {final_norm:.4f}")
             all_results.append((label, xs, us))
@@ -252,7 +315,7 @@ def main():
         print(f"Simulating from hang-down for {args.duration}s, a={args.friction}")
 
         xs, us = simulate_policy(policy_params, lyap_params, lyap_cfg, x0, p, dt, n_steps,
-                                 a_true=args.friction)
+                                 a_true=args.friction, **blend_kwargs)
 
         final_norm = np.linalg.norm(xs[-1])
         print(f"Final state: {xs[-1]}")

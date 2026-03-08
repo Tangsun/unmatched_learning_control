@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
 
-from .configs import AcrobotParams, AdaptiveState, Array, CLFConfig, LyapunovConfig
-from .acrobot import acrobot_affine_terms
+from .configs import AdaptiveState, Array, CLFConfig, LyapunovConfig
 from .lyapunov import lyapunov_value_and_grad
+
+# Type alias for control-affine dynamics: (x, params) -> (f, g, y)
+AffineTermsFn = Callable[..., Tuple[Array, Array, Array]]
 
 
 def halfspace_projection(
@@ -56,8 +58,12 @@ def robust_clf_constraint_terms(x: Array,
                                 lyap_params: Dict[str, Any],
                                 lyap_cfg: LyapunovConfig,
                                 clf_cfg: CLFConfig,
-                                p: AcrobotParams) -> Dict[str, Array]:
-    f, g, y = acrobot_affine_terms(x, p)
+                                p: Any,
+                                affine_terms_fn: AffineTermsFn = None,
+                                ) -> Dict[str, Array]:
+    if affine_terms_fn is None:
+        raise ValueError("affine_terms_fn is required")
+    f, g, y = affine_terms_fn(x, p)
     V, gradV = lyapunov_value_and_grad(lyap_params, lyap_cfg, x)
 
     LfV = gradV @ f
@@ -82,8 +88,12 @@ def clf_shield(u_nom: Array,
                lyap_params: Dict[str, Any],
                lyap_cfg: LyapunovConfig,
                clf_cfg: CLFConfig,
-               p: AcrobotParams) -> Tuple[Array, Dict[str, Array]]:
-    f, g, y = acrobot_affine_terms(x, p)
+               p: Any,
+               affine_terms_fn: AffineTermsFn = None,
+               ) -> Tuple[Array, Dict[str, Array]]:
+    if affine_terms_fn is None:
+        raise ValueError("affine_terms_fn is required")
+    f, g, y = affine_terms_fn(x, p)
     V, gradV = lyapunov_value_and_grad(lyap_params, lyap_cfg, x)
     LfV = gradV @ f
     LgV = gradV @ g

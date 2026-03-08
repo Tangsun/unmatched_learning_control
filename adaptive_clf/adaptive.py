@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Callable, Dict, Optional
 
 import jax
 import jax.numpy as jnp
 
-from .configs import AcrobotParams, AdaptiveConfig, AdaptiveState, Array
-from .acrobot import acrobot_affine_terms, acrobot_dynamics_true
+from .configs import AdaptiveConfig, AdaptiveState, Array
 
 
-def init_adaptive_state(p: AcrobotParams, adapt_cfg: AdaptiveConfig) -> AdaptiveState:
+def init_adaptive_state(p: Any, adapt_cfg: AdaptiveConfig) -> AdaptiveState:
+    if not adapt_cfg.adapt_enabled:
+        return AdaptiveState(a_hat=jnp.array(0.0), info=jnp.array(1e-6), radius=jnp.array(0.0))
     a_hat0 = jnp.asarray(0.5 * (p.a_min + p.a_max), dtype=jnp.float32)
     info0 = jnp.asarray(adapt_cfg.info_init, dtype=jnp.float32)
     radius0 = jnp.asarray(max(0.5 * (p.a_max - p.a_min), adapt_cfg.radius_floor), dtype=jnp.float32)
@@ -23,15 +24,22 @@ def adaptive_update_simple(state: AdaptiveState,
                            u: Array,
                            a_true: Array,
                            dt: float,
-                           p: AcrobotParams,
-                           adapt_cfg: AdaptiveConfig) -> AdaptiveState:
+                           p: Any,
+                           adapt_cfg: AdaptiveConfig,
+                           affine_terms_fn: Optional[Callable] = None,
+                           dynamics_fn: Optional[Callable] = None,
+                           ) -> AdaptiveState:
     """Simple online estimator for the first experiment.
 
     This uses simulator-accessible accelerations. It is a practical placeholder,
     not the final theorem-grade certified set update.
     """
-    f, g, y = acrobot_affine_terms(x, p)
-    xdot_true = acrobot_dynamics_true(x, u, a_true, p)
+    if affine_terms_fn is None:
+        raise ValueError("affine_terms_fn is required")
+    if dynamics_fn is None:
+        raise ValueError("dynamics_fn is required")
+    f, g, y = affine_terms_fn(x, p)
+    xdot_true = dynamics_fn(x, u, a_true, p)
 
     qdd_true = xdot_true[2:]
     y_q = y[2:]
@@ -51,6 +59,8 @@ def adaptive_update_simple(state: AdaptiveState,
 def make_policy_observation(x: Array,
                             adaptive_state: AdaptiveState,
                             adapt_cfg: AdaptiveConfig) -> Array:
+    if not adapt_cfg.adapt_enabled:
+        return x
     a_hat_obs = jax.lax.stop_gradient(adaptive_state.a_hat) if adapt_cfg.stopgrad_obs else adaptive_state.a_hat
     rad_obs = jax.lax.stop_gradient(adaptive_state.radius) if adapt_cfg.stopgrad_obs else adaptive_state.radius
     return jnp.concatenate([x, jnp.asarray([a_hat_obs, rad_obs])], axis=0)

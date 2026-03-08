@@ -81,18 +81,51 @@ def acrobot_affine_terms(x: Array, p: AcrobotParams) -> Tuple[Array, Array, Arra
     return f, g, y
 
 
+def acrobot_energy(x: Array, p: AcrobotParams) -> Tuple[Array, Array, Array]:
+    """Return (KE, PE, E_upright) for the acrobot.
+
+    State x = [dq1, dq2, w1, w2] with q1 = pi + dq1, q2 = dq2.
+    """
+    dq1, dq2, w1, w2 = x
+    q1 = jnp.pi + dq1
+    q2 = dq2
+    qdot = jnp.array([w1, w2])
+
+    M, _, _ = acrobot_terms(x, p)
+    KE = 0.5 * qdot @ M @ qdot
+    PE = (-p.m1 * p.g * p.lc1 * jnp.cos(q1)
+          - p.m2 * p.g * (p.l1 * jnp.cos(q1) + p.lc2 * jnp.cos(q1 + q2)))
+    E_up = p.m1 * p.g * p.lc1 + p.m2 * p.g * (p.l1 + p.lc2)
+    return KE, PE, E_up
+
+
 def acrobot_dynamics_true(x: Array, u: Array, a_true: Array, p: AcrobotParams) -> Array:
     f, g, y = acrobot_affine_terms(x, p)
     return f + g * u + y * a_true
 
 
 def rk4_step(dynamics_fn: Callable[[Array, Array, Array, AcrobotParams], Array],
-             x: Array, u: Array, a_true: Array, dt: float, p: AcrobotParams) -> Array:
-    k1 = dynamics_fn(x, u, a_true, p)
-    k2 = dynamics_fn(x + 0.5 * dt * k1, u, a_true, p)
-    k3 = dynamics_fn(x + 0.5 * dt * k2, u, a_true, p)
-    k4 = dynamics_fn(x + dt * k3, u, a_true, p)
-    return x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+             x: Array, u: Array, a_true: Array, dt: float, p: AcrobotParams,
+             n_substeps: int = 1) -> Array:
+    """Single RK4 step (or n_substeps sub-steps with the same control u)."""
+    sub_dt = dt / n_substeps
+
+    def _one_rk4(x_i, _):
+        k1 = dynamics_fn(x_i, u, a_true, p)
+        k2 = dynamics_fn(x_i + 0.5 * sub_dt * k1, u, a_true, p)
+        k3 = dynamics_fn(x_i + 0.5 * sub_dt * k2, u, a_true, p)
+        k4 = dynamics_fn(x_i + sub_dt * k3, u, a_true, p)
+        return x_i + (sub_dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4), None
+
+    if n_substeps == 1:
+        k1 = dynamics_fn(x, u, a_true, p)
+        k2 = dynamics_fn(x + 0.5 * dt * k1, u, a_true, p)
+        k3 = dynamics_fn(x + 0.5 * dt * k2, u, a_true, p)
+        k4 = dynamics_fn(x + dt * k3, u, a_true, p)
+        return x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+
+    x_final, _ = jax.lax.scan(_one_rk4, x, None, length=n_substeps)
+    return x_final
 
 
 def linearize_acrobot_at_upright(p: AcrobotParams, a_nom: float = 0.0) -> Tuple[Array, Array]:
