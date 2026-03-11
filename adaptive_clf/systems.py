@@ -126,6 +126,7 @@ def _cartpole_spec() -> Dict[str, Any]:
         "make_obs": make_obs,
         "wrap_state": wrap_state,
         "x_eq": (0.0, 0.0, 0.0, 0.0),
+        "angle_indices": (1,),  # theta is an angle
         "default_lqr_Q": jnp.diag(jnp.array([1.0, 10.0, 0.1, 0.1])),
         "default_lqr_R": jnp.array([[0.01]]),
         "solve_lqr": solve_cartpole_lqr,
@@ -176,6 +177,7 @@ def _dubins_spec() -> Dict[str, Any]:
         "make_obs": make_obs,
         "wrap_state": wrap_state,
         "x_eq": (0.0, 0.0, 0.0),
+        "angle_indices": (2,),  # e_theta is an angle
         "u_eq": jnp.array([p.v_ref, 0.0]),
         "u_min": jnp.array([p.v_min, p.omega_min]),
         "u_max": jnp.array([p.v_max, p.omega_max]),

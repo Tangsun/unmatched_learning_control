@@ -18,8 +18,9 @@ def halfspace_projection(
     u_nom: Array,
     a_vec: Array,
     b_scalar: Array,
-    eps: float = 1e-8,
+    eps: float = 1e-2,
     clip_bounds: Optional[Tuple[float, float]] = None,
+    alpha_max: float = 0.0,
 ) -> Tuple[Array, Dict[str, Array]]:
     """Euclidean projection onto {u : a^T u <= b}, optionally clipped to a box.
 
@@ -33,12 +34,16 @@ def halfspace_projection(
         For scalar u this is exact (interval intersection).  For multi-input
         u it is a heuristic post-hoc clip that can violate the half-space
         constraint -- a proper joint solver should be used instead.
+    alpha_max : if > 0, cap the projection gain to prevent gradient explosion
+        when ||a_vec||^2 is small (infeasible states).
     """
     a_vec = jnp.atleast_1d(a_vec)
     u_nom = jnp.atleast_1d(u_nom)
     violation = jnp.dot(a_vec, u_nom) - b_scalar
     denom = jnp.maximum(jnp.dot(a_vec, a_vec), eps)
     alpha = jax.nn.relu(violation) / denom
+    if alpha_max > 0:
+        alpha = jnp.minimum(alpha, alpha_max)
     u_proj = u_nom - alpha * a_vec
 
     if clip_bounds is not None:
@@ -90,6 +95,7 @@ def clf_shield(u_nom: Array,
                clf_cfg: CLFConfig,
                p: Any,
                affine_terms_fn: AffineTermsFn = None,
+               alpha_max: float = 0.0,
                ) -> Tuple[Array, Dict[str, Array]]:
     if affine_terms_fn is None:
         raise ValueError("affine_terms_fn is required")
@@ -126,6 +132,7 @@ def clf_shield(u_nom: Array,
         b_scalar=b_scalar,
         eps=clf_cfg.eps_proj,
         clip_bounds=bounds,
+        alpha_max=alpha_max,
     )
 
     aux = {

@@ -56,6 +56,43 @@ def adaptive_update_simple(state: AdaptiveState,
     return AdaptiveState(a_hat=a_hat_next, info=info_next, radius=radius_next)
 
 
+def adaptive_update_generic(state: AdaptiveState,
+                            x: Array,
+                            u: Array,
+                            a_true: Array,
+                            dt: float,
+                            p: Any,
+                            adapt_cfg: AdaptiveConfig,
+                            affine_terms_fn: Optional[Callable] = None,
+                            dynamics_fn: Optional[Callable] = None,
+                            ) -> AdaptiveState:
+    """Generic adaptive update using full-state residual.
+
+    Works for any control-affine system: xdot = f(x) + g(x) @ u + y(x) * a.
+    Update law: a_hat += eta * y^T * (xdot_true - xdot_model) * dt.
+    """
+    if affine_terms_fn is None:
+        raise ValueError("affine_terms_fn is required")
+    if dynamics_fn is None:
+        raise ValueError("dynamics_fn is required")
+    f, g, y = affine_terms_fn(x, p)
+    xdot_true = dynamics_fn(x, u, a_true, p)
+
+    # g @ u works for both scalar u (g is (n,) and u is scalar)
+    # and vector u (g is (n,m) and u is (m,))
+    xdot_model = f + g @ u + y * state.a_hat
+    residual = xdot_true - xdot_model  # = y * (a_true - a_hat)
+
+    a_hat_next = state.a_hat + adapt_cfg.eta * jnp.dot(y, residual) * dt
+    a_hat_next = jnp.clip(a_hat_next, p.a_min, p.a_max)
+
+    info_next = state.info + jnp.dot(y, y) * dt
+    radius_next = adapt_cfg.radius_scale / jnp.sqrt(info_next + 1e-6)
+    radius_next = jnp.maximum(radius_next, adapt_cfg.radius_floor)
+
+    return AdaptiveState(a_hat=a_hat_next, info=info_next, radius=radius_next)
+
+
 def make_policy_observation(x: Array,
                             adaptive_state: AdaptiveState,
                             adapt_cfg: AdaptiveConfig) -> Array:

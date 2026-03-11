@@ -335,12 +335,18 @@ def train(
             lyap_mode_str = "quadratic_learned"
         else:
             lyap_mode_str = lyap_mode
-        lyap_cfg = LyapunovConfig(
+
+        # Build mode-specific LyapunovConfig kwargs
+        lyap_kwargs = dict(
             mode=lyap_mode_str,
             state_dim=state_dim,
             x_eq=spec["x_eq"],
             P_init=P_lqr,
         )
+        if lyap_mode_str == "energy_cartpole":
+            lyap_kwargs["energy_phys"] = (p.mp, p.l, p.g)
+
+        lyap_cfg = LyapunovConfig(**lyap_kwargs)
         lyap_params = init_lyapunov_params(lyap_key, lyap_cfg)
     else:
         lyap_cfg = None
@@ -589,7 +595,8 @@ def main():
     parser.add_argument("--learn-lyap", action="store_true",
                         help="Jointly learn Lyapunov P (implies --clf)")
     parser.add_argument("--lyap-mode", type=str, default="quadratic_fixed",
-                        choices=["quadratic_fixed", "quadratic_learned", "mlp_psd"])
+                        choices=["quadratic_fixed", "quadratic_learned", "mlp_psd",
+                                 "energy_cartpole"])
     parser.add_argument("--lambda-clf", type=float, default=0.5)
     parser.add_argument("--region-scale", type=float, default=1.0)
     parser.add_argument("--a-true", type=float, default=0.0,

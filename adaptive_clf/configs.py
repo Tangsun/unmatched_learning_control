@@ -53,6 +53,14 @@ class LyapunovConfig:
 
     eps_pd: float = 1e-3
 
+    # Indices of angular state components (wrapped via arctan2 in diff computation)
+    angle_indices: Tuple[int, ...] = ()
+
+    # Energy-based mode: V = E(x)^2 + w_cart * x_cart^2 + w_vel * x_cart_dot^2
+    # energy_phys = (mp, l, g) for pendulum energy computation
+    energy_phys: Optional[Tuple[float, ...]] = None
+    energy_weights: Tuple[float, ...] = (1.0, 0.1)  # (w_cart, w_vel)
+
 
 @dataclass(frozen=True)
 class AdaptiveConfig:
