@@ -1,4 +1,8 @@
-"""Adaptive estimator: state initialization, online update, observation builder."""
+"""Adaptive estimator: state initialization, online update, observation builder.
+
+Includes both the legacy heuristic estimator (adaptive_update_generic) and
+the observer-based scheme from Section 2.1 of main.pdf (adaptive_update_observer).
+"""
 
 from __future__ import annotations
 
@@ -10,14 +14,59 @@ import jax.numpy as jnp
 from .configs import AdaptiveConfig, AdaptiveState, Array
 
 
-def init_adaptive_state(p: Any, adapt_cfg: AdaptiveConfig) -> AdaptiveState:
-    if not adapt_cfg.adapt_enabled:
-        return AdaptiveState(a_hat=jnp.array(0.0), info=jnp.array(1e-6), radius=jnp.array(0.0))
-    a_hat0 = jnp.asarray(0.5 * (p.a_min + p.a_max), dtype=jnp.float32)
-    info0 = jnp.asarray(adapt_cfg.info_init, dtype=jnp.float32)
-    radius0 = jnp.asarray(max(0.5 * (p.a_max - p.a_min), adapt_cfg.radius_floor), dtype=jnp.float32)
-    return AdaptiveState(a_hat=a_hat0, info=info0, radius=radius0)
+# ---------------------------------------------------------------------------
+# Helper: construct AdaptiveState with correct shapes
+# ---------------------------------------------------------------------------
 
+def make_adaptive_state(a_hat, info, radius, state_dim: int = 0,
+                        x_hat=None, w=None, eta=None) -> AdaptiveState:
+    """Build an AdaptiveState, filling observer fields with zeros if omitted."""
+    n = max(state_dim, 1)
+    zeros = jnp.zeros(n, dtype=jnp.float32)
+    return AdaptiveState(
+        a_hat=jnp.asarray(a_hat, dtype=jnp.float32),
+        info=jnp.asarray(info, dtype=jnp.float32),
+        radius=jnp.asarray(radius, dtype=jnp.float32),
+        x_hat=zeros if x_hat is None else jnp.asarray(x_hat, dtype=jnp.float32),
+        w=zeros if w is None else jnp.asarray(w, dtype=jnp.float32),
+        eta=zeros if eta is None else jnp.asarray(eta, dtype=jnp.float32),
+    )
+
+
+def init_adaptive_state(p: Any, adapt_cfg: AdaptiveConfig,
+                        state_dim: int = 3,
+                        x0: Optional[Array] = None) -> AdaptiveState:
+    """Initialize adaptive state.
+
+    For observer mode, x0 is the initial measured state (used for x_hat(0)=x0
+    so that e(0)=0 and eta(0)=0).
+    """
+    if not adapt_cfg.adapt_enabled:
+        return make_adaptive_state(0.0, 1e-6, 0.0, state_dim=state_dim)
+
+    a_hat0 = 0.5 * (p.a_min + p.a_max)
+    radius0 = max(0.5 * (p.a_max - p.a_min), adapt_cfg.radius_floor)
+
+    if adapt_cfg.use_observer:
+        # Observer: x_hat(0)=x0 so e(0)=0, w(0)=0, eta(0)=e(0)=0
+        x_hat0 = jnp.zeros(state_dim) if x0 is None else x0
+        w0 = jnp.zeros(state_dim, dtype=jnp.float32)
+        eta0 = jnp.zeros(state_dim, dtype=jnp.float32)
+        return make_adaptive_state(
+            a_hat0, adapt_cfg.info_init, radius0,
+            state_dim=state_dim,
+            x_hat=x_hat0, w=w0, eta=eta0,
+        )
+    else:
+        info0 = adapt_cfg.info_init
+        return make_adaptive_state(
+            a_hat0, info0, radius0, state_dim=state_dim,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Legacy heuristic estimators (use xdot_true — not available in practice)
+# ---------------------------------------------------------------------------
 
 def adaptive_update_simple(state: AdaptiveState,
                            x: Array,
@@ -53,7 +102,7 @@ def adaptive_update_simple(state: AdaptiveState,
     radius_next = adapt_cfg.radius_scale / jnp.sqrt(info_next + 1e-6)
     radius_next = jnp.maximum(radius_next, adapt_cfg.radius_floor)
 
-    return AdaptiveState(a_hat=a_hat_next, info=info_next, radius=radius_next)
+    return state._replace(a_hat=a_hat_next, info=info_next, radius=radius_next)
 
 
 def adaptive_update_generic(state: AdaptiveState,
@@ -78,8 +127,6 @@ def adaptive_update_generic(state: AdaptiveState,
     f, g, y = affine_terms_fn(x, p)
     xdot_true = dynamics_fn(x, u, a_true, p)
 
-    # g @ u works for both scalar u (g is (n,) and u is scalar)
-    # and vector u (g is (n,m) and u is (m,))
     xdot_model = f + g @ u + y * state.a_hat
     residual = xdot_true - xdot_model  # = y * (a_true - a_hat)
 
@@ -90,8 +137,97 @@ def adaptive_update_generic(state: AdaptiveState,
     radius_next = adapt_cfg.radius_scale / jnp.sqrt(info_next + 1e-6)
     radius_next = jnp.maximum(radius_next, adapt_cfg.radius_floor)
 
-    return AdaptiveState(a_hat=a_hat_next, info=info_next, radius=radius_next)
+    return state._replace(a_hat=a_hat_next, info=info_next, radius=radius_next)
 
+
+# ---------------------------------------------------------------------------
+# Observer-based adaptation (Section 2.1 of main.pdf)
+# ---------------------------------------------------------------------------
+
+def adaptive_update_observer(state: AdaptiveState,
+                             x: Array,
+                             u: Array,
+                             dt: float,
+                             p: Any,
+                             adapt_cfg: AdaptiveConfig,
+                             affine_terms_fn: Optional[Callable] = None,
+                             ) -> AdaptiveState:
+    """Observer-based adaptive update using only state measurements.
+
+    Implements the scheme from Section 2.1:
+      Predictor: x_hat_dot = f(x) + g(x) u + Y(x) a_hat + k * e
+      Filter:    w_dot = Y(x) - k * w
+      Auxiliary:  eta_dot = -k * eta
+      Update:    a_hat_dot = gamma * w^T * (e - eta)
+
+    Uses exponential integrator for the linear parts (w, eta) to avoid
+    stiffness with large k. The predictor uses Euler.
+
+    Does NOT require a_true — only uses measured state x.
+    """
+    if affine_terms_fn is None:
+        raise ValueError("affine_terms_fn is required")
+
+    k = adapt_cfg.observer_k
+    gamma = adapt_cfg.observer_gamma
+    eps_w = adapt_cfg.observer_eps_w
+    margin = adapt_cfg.observer_radius_margin
+
+    f, g, y = affine_terms_fn(x, p)
+
+    # Prediction error (wrap angle if needed — handled by caller wrapping x)
+    e = x - state.x_hat
+
+    # --- Exponential integrator for eta: eta_dot = -k * eta ---
+    # Exact: eta(t+dt) = eta(t) * exp(-k*dt)
+    decay = jnp.exp(-k * dt)
+    eta_next = state.eta * decay
+
+    # --- Exponential integrator for w: w_dot = Y(x) - k * w ---
+    # Exact for constant Y over [t, t+dt]:
+    #   w(t+dt) = w(t)*exp(-k*dt) + Y(x)/k * (1 - exp(-k*dt))
+    w_next = state.w * decay + y * (1.0 - decay) / k
+
+    # --- Predictor: x_hat_dot = f(x) + g(x) u + Y(x) a_hat + k * e ---
+    # Euler step (coupling to a_hat makes exponential integrator impractical)
+    x_hat_dot = f + g @ u + y * state.a_hat + k * e
+    x_hat_next = state.x_hat + x_hat_dot * dt
+
+    # --- Parameter update: a_hat_dot = gamma * w^T * (e - eta) ---
+    innovation = e - state.eta
+    a_hat_dot = gamma * jnp.dot(state.w, innovation)
+    a_hat_next = state.a_hat + a_hat_dot * dt
+    a_hat_next = jnp.clip(a_hat_next, p.a_min, p.a_max)
+
+    # --- Radius from observer: |a_tilde_est| = |w^T(e - eta)| / max(||w||^2, eps_w) ---
+    # Only trust the estimate when ||w||^2 > eps_w (filter has accumulated signal).
+    # When w is too small, keep the prior radius to avoid false confidence.
+    w_norm_sq = jnp.dot(state.w, state.w)
+    a_tilde_est = jnp.dot(state.w, innovation) / jnp.maximum(w_norm_sq, eps_w)
+    r_raw = jnp.abs(a_tilde_est) + margin
+    w_ready = w_norm_sq > eps_w
+    r_candidate = jnp.where(w_ready, r_raw, state.radius)
+
+    # Monotonic envelope: radius can only shrink
+    radius_next = jnp.minimum(state.radius, r_candidate)
+    radius_next = jnp.maximum(radius_next, adapt_cfg.radius_floor)
+
+    # Keep info updated for diagnostics (accumulated ||Y||^2)
+    info_next = state.info + jnp.dot(y, y) * dt
+
+    return AdaptiveState(
+        a_hat=a_hat_next,
+        info=info_next,
+        radius=radius_next,
+        x_hat=x_hat_next,
+        w=w_next,
+        eta=eta_next,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Observation builder
+# ---------------------------------------------------------------------------
 
 def make_policy_observation(x: Array,
                             adaptive_state: AdaptiveState,

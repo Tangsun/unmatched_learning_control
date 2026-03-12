@@ -35,7 +35,7 @@ from .configs import Array, AdaptiveConfig, AdaptiveState, CLFConfig, LyapunovCo
 from .nn import init_policy_params
 from .lyapunov import init_lyapunov_params, lyapunov_value_and_grad
 from .shield import clf_shield
-from .adaptive import adaptive_update_generic, init_adaptive_state
+from .adaptive import adaptive_update_generic, adaptive_update_observer, init_adaptive_state
 from .integrator import rk4_step_generic
 from .systems import get_system, list_systems
 from .train_unified import (
@@ -89,11 +89,17 @@ def _episode_rollout_lyap(
     dynamics_fn = spec["dynamics_fn"]
     make_obs = spec["make_obs"]
     use_adapt = adapt_cfg is not None and adapt_cfg.adapt_enabled
+    state_dim = spec["state_dim"]
+    use_observer = use_adapt and adapt_cfg.use_observer
 
-    adapt_state0 = (init_adaptive_state(p, adapt_cfg) if use_adapt
+    adapt_state0 = (init_adaptive_state(p, adapt_cfg, state_dim=state_dim, x0=x0)
+                    if use_adapt
                     else AdaptiveState(
                         a_hat=jnp.array(0.0), info=jnp.array(1e-6),
-                        radius=jnp.array(0.0)))
+                        radius=jnp.array(0.0),
+                        x_hat=jnp.zeros(state_dim),
+                        w=jnp.zeros(state_dim),
+                        eta=jnp.zeros(state_dim)))
 
     def body(carry, _):
         x_raw, adapt_st = carry
@@ -164,7 +170,12 @@ def _episode_rollout_lyap(
                      + w_violation * feas_penalty)
 
         # Adaptive update (stop_gradient so no backprop through estimator)
-        if use_adapt:
+        if use_observer:
+            adapt_next = adaptive_update_observer(
+                adapt_st, x, u, dt, p, adapt_cfg,
+                affine_terms_fn=affine_fn)
+            adapt_next = jax.lax.stop_gradient(adapt_next)
+        elif use_adapt:
             adapt_next = adaptive_update_generic(
                 adapt_st, x, u, a_true, dt, p, adapt_cfg,
                 affine_terms_fn=affine_fn, dynamics_fn=dynamics_fn)
@@ -246,8 +257,15 @@ def train_lyapunov(
     # Adaptive estimator
     use_adapt: bool = False,
     adapt_eta: float = 2e-2,
+    # Observer-based adaptation
+    use_observer: bool = False,
+    observer_k: float = 5.0,
+    observer_gamma: float = 5.0,
+    # Freeze Lyapunov (train policy only)
+    freeze_lyap: bool = False,
     # Warm start
     warmstart_from: str | None = None,
+    warmstart_lyap_only: bool = False,
     # Saving
     save_dir: str | None = None,
     seed: int = 0,
@@ -268,6 +286,9 @@ def train_lyapunov(
     adapt_cfg = AdaptiveConfig(
         adapt_enabled=use_adapt, eta=adapt_eta,
         stopgrad_obs=True,
+        use_observer=use_observer,
+        observer_k=observer_k,
+        observer_gamma=observer_gamma,
     ) if use_adapt else None
 
     # LQR
@@ -297,22 +318,30 @@ def train_lyapunov(
         ws_path = os.path.join(warmstart_from, "policy_params.pkl")
         with open(ws_path, "rb") as f:
             ws_data = pickle.load(f)
-        policy_params = ws_data["nn"]
         lyap_cfg = ws_data["lyap_cfg"]
         lyap_params = ws_data["lyap_params"]
-        # Expand first layer if obs_dim changed (e.g., adding adaptive inputs)
-        ws_obs_dim = ws_data.get("obs_dim", obs_dim)
-        if ws_obs_dim != obs_dim:
-            W0 = policy_params["layers"][0]["W"]  # (ws_obs_dim, hidden)
-            extra = obs_dim - ws_obs_dim
-            W0_new = jnp.concatenate(
-                [W0, jnp.zeros((extra, W0.shape[1]))], axis=0)
-            layers = list(policy_params["layers"])
-            layers[0] = {**layers[0], "W": W0_new}
-            policy_params = {**policy_params, "layers": tuple(layers)}
-            print(f"  Expanded policy input: {ws_obs_dim} -> {obs_dim} "
-                  f"(+{extra} adaptive inputs)")
-        print(f"  Warm-started from: {ws_path}")
+        if warmstart_lyap_only:
+            # Fresh policy, loaded Lyapunov only
+            key, init_key = jax.random.split(key)
+            policy_params = init_policy_params(
+                init_key, obs_dim, hidden_sizes, out_dim=ctrl_dim)
+            print(f"  Warm-started Lyapunov only from: {ws_path}")
+            print(f"  Policy initialized from scratch (obs_dim={obs_dim})")
+        else:
+            policy_params = ws_data["nn"]
+            # Expand first layer if obs_dim changed (e.g., adding adaptive inputs)
+            ws_obs_dim = ws_data.get("obs_dim", obs_dim)
+            if ws_obs_dim != obs_dim:
+                W0 = policy_params["layers"][0]["W"]  # (ws_obs_dim, hidden)
+                extra = obs_dim - ws_obs_dim
+                W0_new = jnp.concatenate(
+                    [W0, jnp.zeros((extra, W0.shape[1]))], axis=0)
+                layers = list(policy_params["layers"])
+                layers[0] = {**layers[0], "W": W0_new}
+                policy_params = {**policy_params, "layers": tuple(layers)}
+                print(f"  Expanded policy input: {ws_obs_dim} -> {obs_dim} "
+                      f"(+{extra} adaptive inputs)")
+            print(f"  Warm-started from: {ws_path}")
     else:
         key, init_key = jax.random.split(key)
         policy_params = init_policy_params(
@@ -354,7 +383,10 @@ def train_lyapunov(
     @jax.jit
     def step_fn(all_params, opt_state, batch_x0, batch_a, w_violation):
         def loss_fn(params):
-            lp = _reconstruct_lyap(params["lyap_phi"])
+            phi = params["lyap_phi"]
+            if freeze_lyap:
+                phi = jax.lax.stop_gradient(phi)
+            lp = _reconstruct_lyap(phi)
             return _batched_loss_lyap(
                 params["policy"], lp, batch_x0, batch_a,
                 spec, hidden_sizes, lqr_K, horizon, dt,
@@ -380,7 +412,8 @@ def train_lyapunov(
           f"{steps_per_epoch} steps/epoch")
     print(f"  lr={lr}, grad_clip={max_grad_norm}")
     print(f"  lambda_clf={lambda_clf}, w_violation={w_violation_start} -> {w_violation_end}")
-    print(f"  V network: MLP-PSD {lyap_hidden}")
+    lyap_str = f"MLP-PSD {lyap_hidden}" + (" (FROZEN)" if freeze_lyap else "")
+    print(f"  V network: {lyap_str}")
     shield_str = "OFF"
     if use_shield:
         shield_str = "ON (differentiable)" if shield_diff else "ON (stop_gradient)"
@@ -390,7 +423,10 @@ def train_lyapunov(
     a_str = f"a_true={a_true}" if a_range == 0 else f"a ~ U[-{a_range}, {a_range}]"
     print(f"  Uncertainty: {a_str}")
     if use_adapt:
-        print(f"  Adaptive estimator: ON (eta={adapt_eta}, obs_dim={obs_dim})")
+        if use_observer:
+            print(f"  Adaptive: OBSERVER (k={observer_k}, gamma={observer_gamma}, obs_dim={obs_dim})")
+        else:
+            print(f"  Adaptive: HEURISTIC (eta={adapt_eta}, obs_dim={obs_dim})")
     print(f"  Saving to: {save_dir}")
     print(f"{'='*60}\n")
 
@@ -644,8 +680,18 @@ def main():
                         help="Enable online adaptive estimator (augments obs)")
     parser.add_argument("--adapt-eta", type=float, default=2e-2,
                         help="Adaptive estimator learning rate")
+    parser.add_argument("--observer", action="store_true",
+                        help="Use observer-based adaptation (Section 2.1)")
+    parser.add_argument("--observer-k", type=float, default=5.0,
+                        help="Observer gain (eigenvalue of eta decay)")
+    parser.add_argument("--observer-gamma", type=float, default=5.0,
+                        help="Observer adaptation gain for a_hat update")
+    parser.add_argument("--freeze-lyap", action="store_true",
+                        help="Freeze Lyapunov params (train policy only)")
     parser.add_argument("--warmstart-from", type=str, default=None,
                         help="Path to a previous run dir to warm-start from")
+    parser.add_argument("--warmstart-lyap-only", action="store_true",
+                        help="Load only Lyapunov params from warmstart, fresh policy")
     parser.add_argument("--save-dir", type=str, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=5)
@@ -672,9 +718,14 @@ def main():
         curriculum_frac=args.curriculum_frac,
         a_true=args.a_true,
         a_range=args.a_range,
-        use_adapt=args.adapt,
+        use_adapt=args.adapt or args.observer,
         adapt_eta=args.adapt_eta,
+        use_observer=args.observer,
+        observer_k=args.observer_k,
+        observer_gamma=args.observer_gamma,
+        freeze_lyap=args.freeze_lyap,
         warmstart_from=args.warmstart_from,
+        warmstart_lyap_only=args.warmstart_lyap_only,
         save_dir=args.save_dir,
         seed=args.seed,
         log_every=args.log_every,

@@ -71,6 +71,13 @@ class AdaptiveConfig:
     stopgrad_obs: bool = True
     adapt_enabled: bool = False
 
+    # Observer-based adaptation (Section 2.1 of main.pdf)
+    use_observer: bool = False
+    observer_k: float = 5.0       # observer/filter gain (eigenvalue of eta decay)
+    observer_gamma: float = 5.0   # adaptation gain for a_hat update
+    observer_radius_margin: float = 0.01  # safety margin added to radius estimate
+    observer_eps_w: float = 0.01  # floor for ||w||^2 in radius computation
+
 
 @dataclass(frozen=True)
 class CLFConfig:
@@ -143,3 +150,8 @@ class AdaptiveState(NamedTuple):
     a_hat: Array
     info: Array
     radius: Array
+    # Observer fields (zeros when observer disabled).
+    # Defaults allow legacy code to construct AdaptiveState(a_hat, info, radius).
+    x_hat: Array = jnp.zeros(1)   # state predictor estimate (state_dim,)
+    w: Array = jnp.zeros(1)       # filter state (state_dim,) for scalar a
+    eta: Array = jnp.zeros(1)     # auxiliary signal (state_dim,)
