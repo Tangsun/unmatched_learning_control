@@ -44,18 +44,47 @@ from adaptive_clf.lyapunov import lyapunov_value_and_grad
 from adaptive_clf.shield import clf_shield
 from adaptive_clf.nn import policy_apply
 from adaptive_clf.integrator import rk4_step_generic
+from adaptive_clf.eval_rollout import make_eval_rollout_fn, make_batched_metrics_fn
 
 
 # ---------------------------------------------------------------------------
 # Rollout (generic, works for any system)
 # ---------------------------------------------------------------------------
 
+def make_rollout(policy_params, lyap_params, lyap_cfg, lambda_clf,
+                 spec, hidden_sizes, adapt_cfg, horizon=400, dt=0.05,
+                 use_shield=True, policy_obs_dim=None,
+                 enforce_input_bounds=False, initial_radius=None):
+    """Build a reusable compiled rollout function: fn(x0, a_true) -> dict."""
+    return make_eval_rollout_fn(
+        policy_params, lyap_params, lyap_cfg, lambda_clf,
+        spec, hidden_sizes, adapt_cfg,
+        horizon, dt, use_shield, policy_obs_dim,
+        enforce_input_bounds=enforce_input_bounds,
+        initial_radius=initial_radius,
+    )
+
+
 def run_eval_rollout(
     x0, a_true, policy_params, lyap_params, lyap_cfg, lambda_clf,
     spec, hidden_sizes, adapt_cfg, horizon=400, dt=0.05,
     use_shield=True, policy_obs_dim=None,
 ):
-    """Single trajectory eval with observer running."""
+    """Single trajectory eval -- delegates to compiled lax.scan rollout."""
+    fn = make_rollout(
+        policy_params, lyap_params, lyap_cfg, lambda_clf,
+        spec, hidden_sizes, adapt_cfg,
+        horizon, dt, use_shield, policy_obs_dim,
+    )
+    return fn(x0, a_true)
+
+
+def _run_eval_rollout_eager(
+    x0, a_true, policy_params, lyap_params, lyap_cfg, lambda_clf,
+    spec, hidden_sizes, adapt_cfg, horizon=400, dt=0.05,
+    use_shield=True, policy_obs_dim=None,
+):
+    """Eager fallback for debugging (original Python-loop version)."""
     p = spec["params"]
     if policy_obs_dim is None:
         policy_obs_dim = spec["obs_dim"]
@@ -108,14 +137,15 @@ def run_eval_rollout(
                 alpha_max=0.0,
             )
             feasibles.append(float(shield_aux["feasible"]))
+            V = shield_aux["V"]
         else:
             if ctrl_dim == 1:
                 u = jnp.clip(u_nom, p.u_min, p.u_max)
             else:
                 u = jnp.clip(u_nom, spec["u_min"], spec["u_max"])
             feasibles.append(1.0)
+            V, _ = lyapunov_value_and_grad(lyap_params, lyap_cfg, x)
 
-        V, _ = lyapunov_value_and_grad(lyap_params, lyap_cfg, x)
         Vs.append(float(V))
 
         a_hats.append(float(adapt_st.a_hat))
@@ -461,44 +491,38 @@ def compare_runs(run_dirs, a_values, observer_k, observer_gamma,
     # Results table: {run_name: {a_true: mean_terminal_norm}}
     table = {name: {} for name in models}
 
+    # Build batched rollout fn per model (once), then sweep a_values
+    batched_fns = {}
+    for name, data in models.items():
+        use_adapt = data.get("use_adapt", False)
+        if use_adapt:
+            adapt_cfg = AdaptiveConfig(
+                adapt_enabled=True,
+                use_observer=True,
+                observer_k=observer_k,
+                observer_gamma=observer_gamma,
+                stopgrad_obs=True,
+            )
+        else:
+            adapt_cfg = None
+
+        batched_fns[name] = make_batched_metrics_fn(
+            policy_params=data["nn"],
+            lyap_params=data["lyap_params"],
+            lyap_cfg=data["lyap_cfg"],
+            lambda_clf=data.get("lambda_clf", 0.1),
+            spec=spec,
+            hidden_sizes=data.get("hidden_sizes", (64, 64)),
+            adapt_cfg=adapt_cfg,
+            horizon=horizon, dt=dt,
+            use_shield=False,
+            policy_obs_dim=data.get("obs_dim", spec["obs_dim"]),
+        )
+
     for a_val in a_values:
-        for name, data in models.items():
-            policy_params = data["nn"]
-            lyap_params = data["lyap_params"]
-            lyap_cfg = data["lyap_cfg"]
-            lambda_clf = data.get("lambda_clf", 0.1)
-            hidden_sizes = data.get("hidden_sizes", (64, 64))
-            policy_obs_dim = data.get("obs_dim", spec["obs_dim"])
-            use_adapt = data.get("use_adapt", False)
-
-            if use_adapt:
-                adapt_cfg = AdaptiveConfig(
-                    adapt_enabled=True,
-                    use_observer=True,
-                    observer_k=observer_k,
-                    observer_gamma=observer_gamma,
-                    stopgrad_obs=True,
-                )
-            else:
-                adapt_cfg = None
-
-            norms = []
-            for x0 in x0s:
-                res = run_eval_rollout(
-                    x0=np.array(x0), a_true=a_val,
-                    policy_params=policy_params,
-                    lyap_params=lyap_params,
-                    lyap_cfg=lyap_cfg,
-                    lambda_clf=lambda_clf,
-                    spec=spec,
-                    hidden_sizes=hidden_sizes,
-                    adapt_cfg=adapt_cfg,
-                    horizon=horizon, dt=dt,
-                    use_shield=False,
-                    policy_obs_dim=policy_obs_dim,
-                )
-                norms.append(np.linalg.norm(res["xs"][-1]))
-            table[name][a_val] = np.mean(norms)
+        for name in models:
+            norms = batched_fns[name](np.array(x0s), a_val)
+            table[name][a_val] = float(np.mean(norms))
 
     # Print table
     print(f"\n{'=' * 70}")
@@ -563,7 +587,12 @@ def main():
     parser.add_argument("--n-ics", type=int, default=6)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-shield", action="store_true")
-    parser.add_argument("--no-animate", action="store_true")
+    parser.add_argument("--enforce-input-bounds", action="store_true",
+                        help="Clip shield output to [u_min, u_max] after projection")
+    parser.add_argument("--initial-radius", type=float, default=None,
+                        help="Override initial uncertainty radius (default: from system params)")
+    parser.add_argument("--animate", action="store_true",
+                        help="Generate GIF animations (off by default)")
     parser.add_argument("--anim-skip", type=int, default=2)
     parser.add_argument("--anim-fps", type=int, default=20)
     parser.add_argument("--save-dir", type=str, default=None)
@@ -624,24 +653,29 @@ def main():
     print(f"PVTOL eval: {run_name}")
     print(f"  a_wind={args.a_true}, {adapt_str}")
     print(f"  horizon={args.horizon}, dt={args.dt}, {args.n_ics} ICs")
-    print(f"  shield={'OFF' if args.no_shield else 'ON'}")
+    print(f"  shield={'OFF' if args.no_shield else 'ON'}"
+          f"{' (input bounds enforced)' if args.enforce_input_bounds else ''}")
     print()
+
+    # Build compiled rollout once, reuse for all ICs
+    eval_fn = make_rollout(
+        policy_params=policy_params,
+        lyap_params=lyap_params,
+        lyap_cfg=lyap_cfg,
+        lambda_clf=lambda_clf,
+        spec=spec,
+        hidden_sizes=hidden_sizes,
+        adapt_cfg=adapt_cfg,
+        horizon=args.horizon, dt=args.dt,
+        use_shield=not args.no_shield,
+        policy_obs_dim=policy_obs_dim,
+        enforce_input_bounds=args.enforce_input_bounds,
+        initial_radius=args.initial_radius,
+    )
 
     all_results = []
     for i, x0 in enumerate(x0s):
-        res = run_eval_rollout(
-            x0=np.array(x0), a_true=args.a_true,
-            policy_params=policy_params,
-            lyap_params=lyap_params,
-            lyap_cfg=lyap_cfg,
-            lambda_clf=lambda_clf,
-            spec=spec,
-            hidden_sizes=hidden_sizes,
-            adapt_cfg=adapt_cfg,
-            horizon=args.horizon, dt=args.dt,
-            use_shield=not args.no_shield,
-            policy_obs_dim=policy_obs_dim,
-        )
+        res = eval_fn(np.array(x0), args.a_true)
         all_results.append(res)
 
         final_err = abs(res["a_hats"][-1] - args.a_true)
@@ -657,7 +691,7 @@ def main():
             title_extra=f"| {run_name}",
         )
 
-        if not args.no_animate:
+        if args.animate:
             ic_str = f"({x0[0]:.1f},{x0[1]:.1f})"
             title = f"{run_name} | wind={args.a_true:.1f} m/s^2 | IC={ic_str}"
             animate_pvtol(

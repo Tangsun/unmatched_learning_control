@@ -81,6 +81,7 @@ def _episode_rollout_lyap(
     adapt_cfg: AdaptiveConfig | None = None,
     shield_diff: bool = False,
     alpha_max: float = 0.0,
+    a_range: float = 0.0,
 ) -> Tuple[Array, Dict[str, Array]]:
     """Rollout with smooth CLF violation penalty."""
     p = spec["params"]
@@ -93,7 +94,9 @@ def _episode_rollout_lyap(
     state_dim = spec["state_dim"]
     use_observer = use_adapt and adapt_cfg.use_observer
 
-    adapt_state0 = (init_adaptive_state(p, adapt_cfg, state_dim=state_dim, x0=x0)
+    # Pass a_range so the initial radius matches the actual disturbance range
+    adapt_state0 = (init_adaptive_state(p, adapt_cfg, state_dim=state_dim, x0=x0,
+                                        a_range=a_range if a_range > 0 else None)
                     if use_adapt
                     else AdaptiveState(
                         a_hat=jnp.array(0.0), info=jnp.array(1e-6),
@@ -211,6 +214,7 @@ def _batched_loss_lyap(
     cost_cfg, lyap_cfg, clf_cfg,
     use_shield, lambda_clf, w_violation, policy_mode,
     adapt_cfg=None, shield_diff=False, alpha_max=0.0,
+    a_range=0.0,
 ):
     def single(x0, a_true):
         return _episode_rollout_lyap(
@@ -219,7 +223,7 @@ def _batched_loss_lyap(
             cost_cfg, lyap_cfg, clf_cfg,
             use_shield, lambda_clf, w_violation, policy_mode,
             adapt_cfg=adapt_cfg, shield_diff=shield_diff,
-            alpha_max=alpha_max,
+            alpha_max=alpha_max, a_range=a_range,
         )
     losses, metrics = jax.vmap(single)(batch_x0, batch_a)
     mean_loss = jnp.mean(losses)
@@ -397,7 +401,7 @@ def train_lyapunov(
                 cost_cfg, lyap_cfg, clf_cfg,
                 use_shield, lambda_clf, w_violation, policy_mode,
                 adapt_cfg=adapt_cfg, shield_diff=shield_diff,
-                alpha_max=alpha_max,
+                alpha_max=alpha_max, a_range=a_range,
             )
         (loss, metrics), grads = jax.value_and_grad(
             loss_fn, has_aux=True)(all_params)

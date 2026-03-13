@@ -35,17 +35,25 @@ def make_adaptive_state(a_hat, info, radius, state_dim: int = 0,
 
 def init_adaptive_state(p: Any, adapt_cfg: AdaptiveConfig,
                         state_dim: int = 3,
-                        x0: Optional[Array] = None) -> AdaptiveState:
+                        x0: Optional[Array] = None,
+                        a_range: Optional[float] = None) -> AdaptiveState:
     """Initialize adaptive state.
 
     For observer mode, x0 is the initial measured state (used for x_hat(0)=x0
     so that e(0)=0 and eta(0)=0).
+
+    a_range: if provided, use this as the half-width of the uncertainty set
+             instead of the system-wide (p.a_min, p.a_max) bounds.
     """
     if not adapt_cfg.adapt_enabled:
         return make_adaptive_state(0.0, 1e-6, 0.0, state_dim=state_dim)
 
-    a_hat0 = 0.5 * (p.a_min + p.a_max)
-    radius0 = max(0.5 * (p.a_max - p.a_min), adapt_cfg.radius_floor)
+    if a_range is not None:
+        a_hat0 = 0.0
+        radius0 = max(a_range, adapt_cfg.radius_floor)
+    else:
+        a_hat0 = 0.5 * (p.a_min + p.a_max)
+        radius0 = max(0.5 * (p.a_max - p.a_min), adapt_cfg.radius_floor)
 
     if adapt_cfg.use_observer:
         # Observer: x_hat(0)=x0 so e(0)=0, w(0)=0, eta(0)=e(0)=0

@@ -39,18 +39,47 @@ from adaptive_clf.systems import get_system
 from adaptive_clf.lyapunov import lyapunov_value_and_grad
 from adaptive_clf.shield import clf_shield
 from adaptive_clf.nn import policy_apply
+from adaptive_clf.eval_rollout import make_eval_rollout_fn
 
 
 # ---------------------------------------------------------------------------
 # Rollout
 # ---------------------------------------------------------------------------
 
+def make_rollout(policy_params, lyap_params, lyap_cfg, lambda_clf,
+                 spec, hidden_sizes, adapt_cfg, horizon=400, dt=0.05,
+                 use_shield=True, policy_obs_dim=None,
+                 enforce_input_bounds=False, initial_radius=None):
+    """Build a reusable compiled rollout function: fn(x0, a_true) -> dict."""
+    return make_eval_rollout_fn(
+        policy_params, lyap_params, lyap_cfg, lambda_clf,
+        spec, hidden_sizes, adapt_cfg,
+        horizon, dt, use_shield, policy_obs_dim,
+        enforce_input_bounds=enforce_input_bounds,
+        initial_radius=initial_radius,
+    )
+
+
 def run_eval_rollout(
     x0, a_true, policy_params, lyap_params, lyap_cfg, lambda_clf,
     spec, hidden_sizes, adapt_cfg, horizon=400, dt=0.05,
     use_shield=True, policy_obs_dim=None,
 ):
-    """Single trajectory eval with observer running."""
+    """Single trajectory eval -- delegates to compiled lax.scan rollout."""
+    fn = make_rollout(
+        policy_params, lyap_params, lyap_cfg, lambda_clf,
+        spec, hidden_sizes, adapt_cfg,
+        horizon, dt, use_shield, policy_obs_dim,
+    )
+    return fn(x0, a_true)
+
+
+def _run_eval_rollout_eager(
+    x0, a_true, policy_params, lyap_params, lyap_cfg, lambda_clf,
+    spec, hidden_sizes, adapt_cfg, horizon=400, dt=0.05,
+    use_shield=True, policy_obs_dim=None,
+):
+    """Eager fallback for debugging (original Python-loop version)."""
     p = spec["params"]
     if policy_obs_dim is None:
         policy_obs_dim = spec["obs_dim"]
@@ -100,12 +129,12 @@ def run_eval_rollout(
                 alpha_max=0.0,
             )
             feasibles.append(float(shield_aux["feasible"]))
+            V = shield_aux["V"]
         else:
             u = u_nom
             feasibles.append(1.0)
+            V, _ = lyapunov_value_and_grad(lyap_params, lyap_cfg, x)
 
-        # Lyapunov value
-        V, _ = lyapunov_value_and_grad(lyap_params, lyap_cfg, x)
         Vs.append(float(V))
 
         # Log observer state
@@ -459,8 +488,12 @@ def main():
                         help="Number of initial conditions to test")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-shield", action="store_true")
-    parser.add_argument("--no-animate", action="store_true",
-                        help="Skip GIF animation (static plots only)")
+    parser.add_argument("--enforce-input-bounds", action="store_true",
+                        help="Clip shield output to [u_min, u_max] after projection")
+    parser.add_argument("--initial-radius", type=float, default=None,
+                        help="Override initial uncertainty radius (default: from system params)")
+    parser.add_argument("--animate", action="store_true",
+                        help="Generate GIF animations (off by default)")
     parser.add_argument("--anim-skip", type=int, default=2,
                         help="Frame skip for animation (higher = faster)")
     parser.add_argument("--anim-fps", type=int, default=20)
@@ -499,29 +532,33 @@ def main():
     print(f"Observer validation: system={system}, a_true={args.a_true}")
     print(f"  k={args.observer_k}, gamma={args.observer_gamma}")
     print(f"  horizon={args.horizon}, dt={args.dt}")
-    print(f"  shield={'OFF' if args.no_shield else 'ON'}")
-    print(f"  animate={'OFF' if args.no_animate else 'ON'} (skip={args.anim_skip})")
+    print(f"  shield={'OFF' if args.no_shield else 'ON'}"
+          f"{' (input bounds enforced)' if args.enforce_input_bounds else ''}")
+    print(f"  animate={'ON' if args.animate else 'OFF'} (skip={args.anim_skip})")
     print(f"  Testing {args.n_ics} ICs from: {args.run_dir}")
     print()
+
+    # Build compiled rollout once, reuse for all ICs
+    eval_fn = make_rollout(
+        policy_params=policy_params,
+        lyap_params=lyap_params,
+        lyap_cfg=lyap_cfg,
+        lambda_clf=lambda_clf,
+        spec=spec,
+        hidden_sizes=hidden_sizes,
+        adapt_cfg=adapt_cfg,
+        horizon=args.horizon,
+        dt=args.dt,
+        use_shield=not args.no_shield,
+        policy_obs_dim=policy_obs_dim,
+        enforce_input_bounds=args.enforce_input_bounds,
+        initial_radius=args.initial_radius,
+    )
 
     all_results = []
     for i, x0 in enumerate(x0s):
         x0 = np.array(x0)
-        res = run_eval_rollout(
-            x0=x0,
-            a_true=args.a_true,
-            policy_params=policy_params,
-            lyap_params=lyap_params,
-            lyap_cfg=lyap_cfg,
-            lambda_clf=lambda_clf,
-            spec=spec,
-            hidden_sizes=hidden_sizes,
-            adapt_cfg=adapt_cfg,
-            horizon=args.horizon,
-            dt=args.dt,
-            use_shield=not args.no_shield,
-            policy_obs_dim=policy_obs_dim,
-        )
+        res = eval_fn(x0, args.a_true)
         all_results.append(res)
 
         final_err = abs(res["a_hats"][-1] - args.a_true)
@@ -538,7 +575,7 @@ def main():
         )
 
         # Animation
-        if not args.no_animate:
+        if args.animate:
             run_name = os.path.basename(args.run_dir)
             a_str = f"a_true={args.a_true:.2f}"
             ic_str = f"({x0[0]:.1f}, {x0[1]:.1f}, {x0[2]:.1f})"
