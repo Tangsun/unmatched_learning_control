@@ -29,7 +29,7 @@ import jax
 import jax.numpy as jnp
 
 from .configs import (
-    AcrobotParams, CartPoleParams, DubinsParams, Array,
+    AcrobotParams, CartPoleParams, DubinsParams, PVTOLParams, Array,
 )
 
 
@@ -196,6 +196,65 @@ def _dubins_spec() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# PVTOL
+# ---------------------------------------------------------------------------
+
+def _pvtol_spec() -> Dict[str, Any]:
+    from .pvtol import (
+        pvtol_affine_terms, pvtol_dynamics,
+        solve_pvtol_lqr,
+    )
+
+    p = PVTOLParams()
+
+    def make_obs(x: Array) -> Array:
+        """[px, py, sin(theta), cos(theta)-1, vx, vy, thetadot]"""
+        return jnp.array([
+            x[0], x[1],
+            jnp.sin(x[2]), jnp.cos(x[2]) - 1.0,
+            x[3], x[4], x[5],
+        ])
+
+    def wrap_state(x: Array) -> Array:
+        return x.at[2].set(jnp.arctan2(jnp.sin(x[2]), jnp.cos(x[2])))
+
+    def sample_ics(key, batch_size, region_scale, a_true=0.0):
+        low = jnp.array([-2.0, -2.0, -0.5, -1.0, -1.0, -1.0]) * region_scale
+        high = jnp.array([2.0, 2.0, 0.5, 1.0, 1.0, 1.0]) * region_scale
+        x0 = jax.random.uniform(key, (batch_size, 6), minval=low, maxval=high)
+        a_batch = jnp.full((batch_size,), a_true)
+        return x0, a_batch
+
+    return {
+        "name": "pvtol",
+        "state_dim": 6,
+        "ctrl_dim": 2,
+        "obs_dim": 7,
+        "params": p,
+        "affine_terms_fn": pvtol_affine_terms,
+        "dynamics_fn": pvtol_dynamics,
+        "make_obs": make_obs,
+        "wrap_state": wrap_state,
+        "x_eq": (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        "angle_indices": (2,),  # theta is an angle
+        "u_eq": jnp.array([p.m * p.g, 0.0]),
+        "u_min": jnp.array([p.T_min, p.tau_min]),
+        "u_max": jnp.array([p.T_max, p.tau_max]),
+        "default_lqr_Q": jnp.diag(jnp.array([2.0, 2.0, 5.0, 0.5, 0.5, 0.5])),
+        "default_lqr_R": jnp.diag(jnp.array([0.01, 0.1])),
+        "solve_lqr": solve_pvtol_lqr,
+        "sample_ics": sample_ics,
+        "default_cost_weights": {
+            "state_weights": (2.0, 2.0, 5.0, 0.5, 0.5, 0.5),
+            "u_weight": 0.01,
+            "terminal_scale": 10.0,
+            "proj_weight": 0.1,
+            "infeasible_weight": 50.0,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -203,6 +262,7 @@ _REGISTRY: Dict[str, Callable[[], Dict[str, Any]]] = {
     "acrobot": _acrobot_spec,
     "cartpole": _cartpole_spec,
     "dubins": _dubins_spec,
+    "pvtol": _pvtol_spec,
 }
 
 

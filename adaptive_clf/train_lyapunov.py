@@ -80,6 +80,7 @@ def _episode_rollout_lyap(
     policy_mode: str,
     adapt_cfg: AdaptiveConfig | None = None,
     shield_diff: bool = False,
+    alpha_max: float = 0.0,
 ) -> Tuple[Array, Dict[str, Array]]:
     """Rollout with smooth CLF violation penalty."""
     p = spec["params"]
@@ -125,7 +126,7 @@ def _episode_rollout_lyap(
                 u_nom=u_nom, x=x, adaptive_state=adapt_st,
                 lyap_params=lyap_params, lyap_cfg=lyap_cfg,
                 clf_cfg=clf_cfg, p=p, affine_terms_fn=affine_fn,
-                alpha_max=0.0,  # no cap: exact halfspace projection
+                alpha_max=alpha_max,
             )
             if shield_diff:
                 # Differentiable shield: gradients flow through projection
@@ -209,7 +210,7 @@ def _batched_loss_lyap(
     spec, hidden_sizes, lqr_K, horizon, dt,
     cost_cfg, lyap_cfg, clf_cfg,
     use_shield, lambda_clf, w_violation, policy_mode,
-    adapt_cfg=None, shield_diff=False,
+    adapt_cfg=None, shield_diff=False, alpha_max=0.0,
 ):
     def single(x0, a_true):
         return _episode_rollout_lyap(
@@ -218,6 +219,7 @@ def _batched_loss_lyap(
             cost_cfg, lyap_cfg, clf_cfg,
             use_shield, lambda_clf, w_violation, policy_mode,
             adapt_cfg=adapt_cfg, shield_diff=shield_diff,
+            alpha_max=alpha_max,
         )
     losses, metrics = jax.vmap(single)(batch_x0, batch_a)
     mean_loss = jnp.mean(losses)
@@ -261,6 +263,8 @@ def train_lyapunov(
     use_observer: bool = False,
     observer_k: float = 5.0,
     observer_gamma: float = 5.0,
+    # Shield projection gain cap (0 = no cap)
+    alpha_max: float = 0.0,
     # Freeze Lyapunov (train policy only)
     freeze_lyap: bool = False,
     # Warm start
@@ -393,6 +397,7 @@ def train_lyapunov(
                 cost_cfg, lyap_cfg, clf_cfg,
                 use_shield, lambda_clf, w_violation, policy_mode,
                 adapt_cfg=adapt_cfg, shield_diff=shield_diff,
+                alpha_max=alpha_max,
             )
         (loss, metrics), grads = jax.value_and_grad(
             loss_fn, has_aux=True)(all_params)
@@ -417,6 +422,8 @@ def train_lyapunov(
     shield_str = "OFF"
     if use_shield:
         shield_str = "ON (differentiable)" if shield_diff else "ON (stop_gradient)"
+    if alpha_max > 0:
+        shield_str += f" (alpha_max={alpha_max})"
     print(f"  Shield: {shield_str}")
     print(f"  Region: {region_start} -> {region_end} "
           f"(curriculum over first {curriculum_frac*100:.0f}% of training)")
@@ -669,6 +676,8 @@ def main():
                         help="Enable CLF shield projection during training")
     parser.add_argument("--shield-diff", action="store_true",
                         help="Differentiable shield (gradients flow through projection)")
+    parser.add_argument("--alpha-max", type=float, default=0.0,
+                        help="Cap projection gain in shield (0=no cap)")
     parser.add_argument("--region-start", type=float, default=0.3)
     parser.add_argument("--region-end", type=float, default=0.3)
     parser.add_argument("--curriculum-frac", type=float, default=0.5,
@@ -713,6 +722,7 @@ def main():
         lyap_hidden=tuple(args.lyap_hidden),
         use_shield=args.shield or args.shield_diff,
         shield_diff=args.shield_diff,
+        alpha_max=args.alpha_max,
         region_start=args.region_start,
         region_end=args.region_end,
         curriculum_frac=args.curriculum_frac,

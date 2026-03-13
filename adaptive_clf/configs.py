@@ -146,6 +146,26 @@ class DubinsParams:
     a_max: float = 0.5
 
 
+@dataclass(frozen=True)
+class PVTOLParams:
+    m: float = 1.0       # mass (kg)
+    J: float = 0.1       # moment of inertia (kg*m^2)
+    g: float = 9.81      # gravity (m/s^2)
+
+    T_min: float = 0.0   # min thrust (N)
+    T_max: float = 20.0  # max thrust (~2*mg)
+    tau_min: float = -2.0 # min torque (N*m)
+    tau_max: float = 2.0  # max torque (N*m)
+
+    u_min: float = 0.0   # not used directly (multi-dim bounds in spec)
+    u_max: float = 20.0
+
+    a_min: float = -3.0  # wind range (m/s^2)
+    a_max: float = 3.0
+
+    eps: float = 1e-8
+
+
 class AdaptiveState(NamedTuple):
     a_hat: Array
     info: Array
