@@ -54,7 +54,8 @@ from adaptive_clf.eval_rollout import make_eval_rollout_fn, make_batched_metrics
 def make_rollout(policy_params, lyap_params, lyap_cfg, lambda_clf,
                  spec, hidden_sizes, adapt_cfg, horizon=400, dt=0.05,
                  use_shield=True, policy_obs_dim=None,
-                 enforce_input_bounds=False, initial_radius=None):
+                 enforce_input_bounds=False, initial_radius=None,
+                 eps_proj=0.1, skip_shield_small_lgv=False):
     """Build a reusable compiled rollout function: fn(x0, a_true) -> dict."""
     return make_eval_rollout_fn(
         policy_params, lyap_params, lyap_cfg, lambda_clf,
@@ -62,6 +63,8 @@ def make_rollout(policy_params, lyap_params, lyap_cfg, lambda_clf,
         horizon, dt, use_shield, policy_obs_dim,
         enforce_input_bounds=enforce_input_bounds,
         initial_radius=initial_radius,
+        eps_proj=eps_proj,
+        skip_shield_small_lgv=skip_shield_small_lgv,
     )
 
 
@@ -69,12 +72,15 @@ def run_eval_rollout(
     x0, a_true, policy_params, lyap_params, lyap_cfg, lambda_clf,
     spec, hidden_sizes, adapt_cfg, horizon=400, dt=0.05,
     use_shield=True, policy_obs_dim=None,
+    eps_proj=0.1, skip_shield_small_lgv=False,
 ):
     """Single trajectory eval -- delegates to compiled lax.scan rollout."""
     fn = make_rollout(
         policy_params, lyap_params, lyap_cfg, lambda_clf,
         spec, hidden_sizes, adapt_cfg,
         horizon, dt, use_shield, policy_obs_dim,
+        eps_proj=eps_proj,
+        skip_shield_small_lgv=skip_shield_small_lgv,
     )
     return fn(x0, a_true)
 
@@ -83,6 +89,7 @@ def _run_eval_rollout_eager(
     x0, a_true, policy_params, lyap_params, lyap_cfg, lambda_clf,
     spec, hidden_sizes, adapt_cfg, horizon=400, dt=0.05,
     use_shield=True, policy_obs_dim=None,
+    eps_proj=0.1, skip_shield_small_lgv=False,
 ):
     """Eager fallback for debugging (original Python-loop version)."""
     p = spec["params"]
@@ -95,7 +102,7 @@ def _run_eval_rollout_eager(
     state_dim = spec["state_dim"]
     ctrl_dim = spec["ctrl_dim"]
 
-    clf_cfg = CLFConfig(enabled=use_shield, lambda_clf=lambda_clf, eps_proj=0.1)
+    clf_cfg = CLFConfig(enabled=use_shield, lambda_clf=lambda_clf, eps_proj=eps_proj)
 
     x = jnp.array(x0, dtype=jnp.float32)
     a_true_arr = jnp.asarray(a_true, dtype=jnp.float32)
@@ -136,6 +143,11 @@ def _run_eval_rollout_eager(
                 clf_cfg=clf_cfg, p=p, affine_terms_fn=affine_fn,
                 alpha_max=0.0,
             )
+            if skip_shield_small_lgv and float(shield_aux["a_norm_sq"]) < eps_proj:
+                if ctrl_dim == 1:
+                    u = jnp.clip(u_nom, p.u_min, p.u_max)
+                else:
+                    u = jnp.clip(u_nom, spec["u_min"], spec["u_max"])
             feasibles.append(float(shield_aux["feasible"]))
             V = shield_aux["V"]
         else:
@@ -160,6 +172,8 @@ def _run_eval_rollout_eager(
             adapt_st = adaptive_update_observer(
                 adapt_st, x, u, dt, p, adapt_cfg,
                 affine_terms_fn=affine_fn,
+                dynamics_fn=dynamics_fn,
+                a_true=a_true_arr,
             )
 
         x = rk4_step_generic(dynamics_fn, x, u, a_true_arr, dt, p)
@@ -184,13 +198,35 @@ def _run_eval_rollout_eager(
 # ---------------------------------------------------------------------------
 
 def plot_pvtol_diagnostics(results, save_path=None, title_extra=""):
-    """9-panel diagnostic plot for PVTOL."""
+    """Diagnostic plot for PVTOL."""
     t = np.arange(len(results["a_hats"]))
     a_true = results["a_true"]
+    eps_proj = float(results.get("eps_proj", 0.1))
+    dt = float(results.get("dt", 0.05))
     xs = results["xs"]
     us = results["us"]
+    LgVs = results.get("LgVs")
+    gradVs = results.get("gradVs")
+    g_col_norms = results.get("g_col_norms")
+    nominal_feasibles = results.get("nominal_feasibles")
+    nominal_violations = results.get("nominal_violations")
+    shield_control_deltas = results.get("shield_control_deltas")
+    applied_control_deltas = results.get("applied_control_deltas")
+    shield_projected_residuals = results.get("shield_projected_residuals")
+    applied_robust_residuals = results.get("applied_robust_residuals")
+    true_clf_residuals = results.get("true_clf_residuals")
+    has_lgv_diag = LgVs is not None
+    has_decomp = has_lgv_diag and gradVs is not None
+    has_ctrl_diag = (
+        shield_control_deltas is not None
+        and applied_control_deltas is not None
+        and shield_projected_residuals is not None
+        and applied_robust_residuals is not None
+        and true_clf_residuals is not None
+    )
+    nrows = 3 + int(has_lgv_diag) + int(has_ctrl_diag) + int(has_decomp)
 
-    fig, axes = plt.subplots(3, 3, figsize=(16, 12))
+    fig, axes = plt.subplots(nrows, 3, figsize=(16, 4 * nrows))
 
     # Row 0: Observer
     ax = axes[0, 0]
@@ -229,7 +265,7 @@ def plot_pvtol_diagnostics(results, save_path=None, title_extra=""):
     ax.grid(True, alpha=0.3)
 
     ax = axes[1, 1]
-    time = t * 0.05  # approximate
+    time = t * dt
     ax.plot(time, xs[:-1, 0], label="px")
     ax.plot(time, xs[:-1, 1], label="py")
     ax.plot(time, xs[:-1, 2], label="theta")
@@ -245,7 +281,7 @@ def plot_pvtol_diagnostics(results, save_path=None, title_extra=""):
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    # Row 2: Controls & feasibility
+    # Row 2: Controls & nominal CLF status
     ax = axes[2, 0]
     ax.plot(time, us[:, 0], label="T (thrust)")
     ax.axhline(9.81, color="gray", ls=":", lw=0.8, label="mg")
@@ -260,10 +296,118 @@ def plot_pvtol_diagnostics(results, save_path=None, title_extra=""):
     ax.grid(True, alpha=0.3)
 
     ax = axes[2, 2]
-    ax.plot(time, results["feasibles"], color="tab:green")
-    ax.set(xlabel="time (s)", ylabel="feasible", title="Shield feasibility")
+    if nominal_feasibles is not None:
+        ax.plot(time, nominal_feasibles, color="tab:green")
+        ax.set(xlabel="time (s)", ylabel="flag", title="Nominal CLF Satisfied")
+    else:
+        ax.plot(time, results["feasibles"], color="tab:green")
+        ax.set(xlabel="time (s)", ylabel="flag", title="Nominal CLF Satisfied")
     ax.set_ylim(-0.05, 1.05)
     ax.grid(True, alpha=0.3)
+
+    next_row = 3
+
+    # Row 3: LgV diagnostics
+    if has_lgv_diag:
+        ax = axes[next_row, 0]
+        LgV_norm = np.linalg.norm(LgVs, axis=-1)
+        ax.plot(time, LgV_norm, color="tab:red")
+        ax.axhline(np.sqrt(eps_proj), color="gray", ls=":", lw=0.8,
+                   label=f"sqrt(eps_proj)={np.sqrt(eps_proj):.3g}")
+        ax.set(xlabel="time (s)", ylabel="||LgV||",
+               title="||LgV|| (shield authority)")
+        ax.set_yscale("symlog", linthresh=1e-4)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+        ax = axes[next_row, 1]
+        if nominal_violations is not None:
+            ax.plot(time, nominal_violations, color="tab:orange", label="LgV^T u_nom - b")
+            ax.axhline(0.0, color="gray", ls=":", lw=0.8)
+            ax.set(xlabel="time (s)", ylabel="violation", title="Nominal CLF Violation")
+            ax.legend(fontsize=8)
+        else:
+            for j in range(LgVs.shape[-1]):
+                ax.plot(time, LgVs[:, j], label=f"LgV[{j}]", alpha=0.8)
+            ax.set(xlabel="time (s)", ylabel="LgV", title="LgV components")
+            ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+        ax = axes[next_row, 2]
+        ax.plot(time, LgV_norm**2, color="tab:red", label="||LgV||^2")
+        ax.axhline(eps_proj, color="gray", ls=":", lw=0.8,
+                   label=f"eps_proj={eps_proj:.3g}")
+        ax.set(xlabel="time (s)", ylabel="||LgV||^2",
+               title="||LgV||^2 vs eps_proj (projection effective above)")
+        ax.set_yscale("symlog", linthresh=1e-4)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        next_row += 1
+
+    # Row 4: control intervention and residuals
+    if has_ctrl_diag:
+        ax = axes[next_row, 0]
+        ax.plot(time, shield_control_deltas, color="tab:blue",
+                label="||u_shield-u_nom||")
+        ax.plot(time, applied_control_deltas, color="tab:purple", ls="--",
+                label="||u-u_nom||")
+        ax.set(xlabel="time (s)", ylabel="control delta",
+               title="Shield Intervention Size")
+        ax.set_yscale("symlog", linthresh=1e-6)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+        ax = axes[next_row, 1]
+        if nominal_violations is not None:
+            ax.plot(time, nominal_violations, color="tab:orange",
+                    label="nominal residual")
+        ax.plot(time, shield_projected_residuals, color="tab:blue",
+                label="shielded residual")
+        ax.plot(time, applied_robust_residuals, color="tab:purple", ls="--",
+                label="applied residual")
+        ax.axhline(0.0, color="gray", ls=":", lw=0.8)
+        ax.set(xlabel="time (s)", ylabel="robust residual",
+               title="Robust CLF Residuals")
+        ax.set_yscale("symlog", linthresh=1e-6)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+        ax = axes[next_row, 2]
+        ax.plot(time, true_clf_residuals, color="tab:red")
+        ax.axhline(0.0, color="gray", ls=":", lw=0.8)
+        ax.set(xlabel="time (s)", ylabel="true residual",
+               title="True CLF Residual")
+        ax.set_yscale("symlog", linthresh=1e-6)
+        ax.grid(True, alpha=0.3)
+        next_row += 1
+
+    # Final row: gradV / G decomposition
+    if has_decomp:
+        ax = axes[next_row, 0]
+        gradV_norm = np.linalg.norm(gradVs, axis=-1)
+        ax.plot(time, gradV_norm, color="tab:blue")
+        ax.set(xlabel="time (s)", ylabel="||dV/dx||",
+               title="||dV/dx|| (Lyapunov gradient norm)")
+        ax.set_yscale("symlog", linthresh=1e-4)
+        ax.grid(True, alpha=0.3)
+
+        ax = axes[next_row, 1]
+        if g_col_norms is not None:
+            for j in range(g_col_norms.shape[-1]):
+                ax.plot(time, g_col_norms[:, j],
+                        label=f"||g_{j}||", alpha=0.8)
+        ax.set(xlabel="time (s)", ylabel="||g_i(x)||",
+               title="G(x) column norms (control effectiveness)")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+        ax = axes[next_row, 2]
+        for j in range(gradVs.shape[-1]):
+            ax.plot(time, gradVs[:, j], label=f"dV/dx[{j}]", alpha=0.7)
+        ax.set(xlabel="time (s)", ylabel="dV/dx_i",
+               title="dV/dx components")
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
 
     final_err = abs(results["a_hats"][-1] - a_true)
     final_xnorm = np.linalg.norm(xs[-1])
@@ -582,6 +726,8 @@ def main():
                         help="Wind values for comparison")
     parser.add_argument("--observer-k", type=float, default=3.0)
     parser.add_argument("--observer-gamma", type=float, default=20.0)
+    parser.add_argument("--lambda-clf", type=float, default=None,
+                        help="Override the saved CLF decay rate for eval")
     parser.add_argument("--horizon", type=int, default=400)
     parser.add_argument("--dt", type=float, default=0.05)
     parser.add_argument("--n-ics", type=int, default=6)
@@ -589,6 +735,10 @@ def main():
     parser.add_argument("--no-shield", action="store_true")
     parser.add_argument("--enforce-input-bounds", action="store_true",
                         help="Clip shield output to [u_min, u_max] after projection")
+    parser.add_argument("--eps-proj", type=float, default=0.1,
+                        help="Projection regularization threshold used by the shield")
+    parser.add_argument("--skip-shield-small-lgv", action="store_true",
+                        help="Use nominal control when ||LgV||^2 < eps_proj")
     parser.add_argument("--initial-radius", type=float, default=None,
                         help="Override initial uncertainty radius (default: from system params)")
     parser.add_argument("--animate", action="store_true",
@@ -626,7 +776,7 @@ def main():
     policy_params = data["nn"]
     lyap_params = data["lyap_params"]
     lyap_cfg = data["lyap_cfg"]
-    lambda_clf = data.get("lambda_clf", 0.1)
+    lambda_clf = data.get("lambda_clf", 0.1) if args.lambda_clf is None else args.lambda_clf
     hidden_sizes = data.get("hidden_sizes", (64, 64))
     policy_obs_dim = data.get("obs_dim", spec["obs_dim"])
     use_adapt = data.get("use_adapt", False)
@@ -653,8 +803,12 @@ def main():
     print(f"PVTOL eval: {run_name}")
     print(f"  a_wind={args.a_true}, {adapt_str}")
     print(f"  horizon={args.horizon}, dt={args.dt}, {args.n_ics} ICs")
+    print(f"  lambda_clf={lambda_clf}")
     print(f"  shield={'OFF' if args.no_shield else 'ON'}"
           f"{' (input bounds enforced)' if args.enforce_input_bounds else ''}")
+    if not args.no_shield:
+        print(f"  eps_proj={args.eps_proj}"
+              f"{' | skip shield when ||LgV||^2 < eps_proj' if args.skip_shield_small_lgv else ''}")
     print()
 
     # Build compiled rollout once, reuse for all ICs
@@ -671,6 +825,8 @@ def main():
         policy_obs_dim=policy_obs_dim,
         enforce_input_bounds=args.enforce_input_bounds,
         initial_radius=args.initial_radius,
+        eps_proj=args.eps_proj,
+        skip_shield_small_lgv=args.skip_shield_small_lgv,
     )
 
     all_results = []
@@ -682,8 +838,10 @@ def main():
         final_r = res["radii"][-1]
         final_xnorm = np.linalg.norm(res["xs"][-1])
         feas_rate = np.mean(res["feasibles"])
+        skip_rate = np.mean(res.get("shield_small_lgv_skips", np.zeros_like(res["feasibles"])))
         print(f"  IC {i}: |xT|={final_xnorm:.3f}, "
-              f"|a_hat-a|={final_err:.4f}, r={final_r:.4f}, feas={feas_rate:.2f}")
+              f"|a_hat-a|={final_err:.4f}, r={final_r:.4f}, "
+              f"feas={feas_rate:.2f}, skip={skip_rate:.2f}")
 
         plot_pvtol_diagnostics(
             res,

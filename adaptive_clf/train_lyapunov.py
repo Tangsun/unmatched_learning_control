@@ -177,7 +177,10 @@ def _episode_rollout_lyap(
         if use_observer:
             adapt_next = adaptive_update_observer(
                 adapt_st, x, u, dt, p, adapt_cfg,
-                affine_terms_fn=affine_fn)
+                affine_terms_fn=affine_fn,
+                dynamics_fn=dynamics_fn,
+                a_true=a_true,
+            )
             adapt_next = jax.lax.stop_gradient(adapt_next)
         elif use_adapt:
             adapt_next = adaptive_update_generic(

@@ -49,6 +49,37 @@ def _make_adapt_st0(p, adapt_cfg, state_dim, x0, a_range=None):
         eta=jnp.zeros(state_dim))
 
 
+def _apply_eval_shield(
+    *,
+    u_nom,
+    x,
+    adapt_st,
+    lyap_params,
+    lyap_cfg,
+    clf_cfg,
+    p,
+    affine_fn,
+    u_min,
+    u_max,
+    skip_shield_small_lgv,
+):
+    """Apply the CLF shield, optionally bypassing it when ||LgV||^2 is small."""
+    u_shield, shield_aux = clf_shield(
+        u_nom=u_nom, x=x, adaptive_state=adapt_st,
+        lyap_params=lyap_params, lyap_cfg=lyap_cfg,
+        clf_cfg=clf_cfg, p=p, affine_terms_fn=affine_fn,
+        alpha_max=0.0,
+    )
+    skip_small_lgv = jnp.logical_and(
+        skip_shield_small_lgv,
+        shield_aux["a_norm_sq"] < clf_cfg.eps_proj,
+    )
+    u_shield_vec = jnp.atleast_1d(u_shield)
+    u_nom_clipped = jnp.atleast_1d(jnp.clip(u_nom, u_min, u_max))
+    u = jnp.where(skip_small_lgv, u_nom_clipped, u_shield_vec).squeeze()
+    return u, u_shield_vec.squeeze(), shield_aux, skip_small_lgv
+
+
 # ---------------------------------------------------------------------------
 # Factory: build reusable JIT-compiled rollout functions
 # ---------------------------------------------------------------------------
@@ -58,6 +89,7 @@ def make_eval_rollout_fn(
     spec, hidden_sizes, adapt_cfg,
     horizon=400, dt=0.05, use_shield=True, policy_obs_dim=None,
     enforce_input_bounds=False, initial_radius=None,
+    eps_proj=0.1, skip_shield_small_lgv=False,
 ):
     """Build a reusable compiled eval rollout function.
 
@@ -77,7 +109,7 @@ def make_eval_rollout_fn(
         policy_obs_dim = obs_dim
 
     clf_cfg = CLFConfig(
-        enabled=use_shield, lambda_clf=lambda_clf, eps_proj=0.1,
+        enabled=use_shield, lambda_clf=lambda_clf, eps_proj=eps_proj,
         enforce_input_bounds=enforce_input_bounds,
     )
     use_observer = adapt_cfg is not None and adapt_cfg.use_observer
@@ -102,33 +134,73 @@ def make_eval_rollout_fn(
         u_nom = policy_apply(policy_params, obs, u_min, u_max,
                              hidden_sizes, out_dim=ctrl_dim)
 
+        # Always compute gradV and G for diagnostics
+        V, gradV = lyapunov_value_and_grad(lyap_params, lyap_cfg, x)
+        f_x, g_mat, y_x = affine_fn(x, p)
+        LfV = gradV @ f_x
+        LgV_nom = gradV @ g_mat
+        LyV = gradV @ y_x
+        b_nom = (
+            -clf_cfg.lambda_clf * V - LfV
+            - LyV * adapt_st.a_hat
+            - jnp.abs(LyV) * adapt_st.radius
+        )
+        nominal_violation = jnp.dot(LgV_nom, u_nom) - b_nom
+        nominal_feasible = jnp.where(nominal_violation <= 0.0, 1.0, 0.0)
+
         if use_shield:
-            u, shield_aux = clf_shield(
-                u_nom=u_nom, x=x, adaptive_state=adapt_st,
+            u, u_shield_raw, shield_aux, skip_small_lgv = _apply_eval_shield(
+                u_nom=u_nom, x=x, adapt_st=adapt_st,
                 lyap_params=lyap_params, lyap_cfg=lyap_cfg,
-                clf_cfg=clf_cfg, p=p, affine_terms_fn=affine_fn,
-                alpha_max=0.0,
+                clf_cfg=clf_cfg, p=p, affine_fn=affine_fn,
+                u_min=u_min, u_max=u_max,
+                skip_shield_small_lgv=skip_shield_small_lgv,
             )
             V = shield_aux["V"]
-            feasible = shield_aux["feasible"]
+            feasible = jnp.where(skip_small_lgv, nominal_feasible,
+                                 shield_aux["feasible"])
+            LgV = shield_aux["LgV"]
         else:
             u = jnp.clip(u_nom, u_min, u_max)
-            V, _ = lyapunov_value_and_grad(lyap_params, lyap_cfg, x)
+            u_shield_raw = u
+            LgV = gradV @ g_mat
             feasible = jnp.array(1.0)
+            skip_small_lgv = jnp.array(0.0)
+
+        u_nom_vec = jnp.atleast_1d(u_nom)
+        u_applied_vec = jnp.atleast_1d(u)
+        u_shield_vec = jnp.atleast_1d(u_shield_raw)
+        shield_control_delta = jnp.linalg.norm(u_shield_vec - u_nom_vec)
+        applied_control_delta = jnp.linalg.norm(u_applied_vec - u_nom_vec)
+        shield_projected_residual = jnp.dot(LgV_nom, u_shield_vec) - b_nom
+        applied_robust_residual = jnp.dot(LgV_nom, u_applied_vec) - b_nom
+        true_clf_residual = (
+            LfV
+            + jnp.dot(LgV_nom, u_applied_vec)
+            + LyV * a_true
+            + clf_cfg.lambda_clf * V
+        )
 
         if use_observer:
             adapt_st_next = adaptive_update_observer(
                 adapt_st, x, u, dt, p, _adapt_cfg,
                 affine_terms_fn=affine_fn,
+                dynamics_fn=dynamics_fn,
+                a_true=a_true,
             )
         else:
             adapt_st_next = adapt_st
 
         x_next = rk4_step_generic(dynamics_fn, x, u, a_true, dt, p)
 
+        # Per-column norms of G(x): ||g_i|| for each control channel
+        g_col_norms = jnp.array([jnp.linalg.norm(g_mat[:, j])
+                                 for j in range(g_mat.shape[1])])
+
         outputs = {
             "x": x,
             "u": u,
+            "u_nom": u_nom,
             "V": V,
             "a_hat": adapt_st.a_hat,
             "radius": adapt_st.radius,
@@ -136,6 +208,17 @@ def make_eval_rollout_fn(
             "e_norm": jnp.linalg.norm(x - adapt_st.x_hat),
             "w_norm": jnp.linalg.norm(adapt_st.w),
             "feasible": feasible,
+            "nominal_feasible": nominal_feasible,
+            "nominal_violation": nominal_violation,
+            "LgV": LgV,
+            "gradV": gradV,
+            "g_col_norms": g_col_norms,
+            "shield_skip_small_lgv": skip_small_lgv.astype(jnp.float32),
+            "shield_control_delta": shield_control_delta,
+            "applied_control_delta": applied_control_delta,
+            "shield_projected_residual": shield_projected_residual,
+            "applied_robust_residual": applied_robust_residual,
+            "true_clf_residual": true_clf_residual,
         }
         return (x_next, adapt_st_next, a_true), outputs
 
@@ -163,6 +246,7 @@ def make_eval_rollout_fn(
         return {
             "xs": xs,
             "us": np.asarray(history["u"]),
+            "u_noms": np.asarray(history["u_nom"]),
             "a_hats": np.asarray(history["a_hat"]),
             "radii": np.asarray(history["radius"]),
             "etas": np.asarray(history["eta_norm"]),
@@ -170,6 +254,20 @@ def make_eval_rollout_fn(
             "ws": np.asarray(history["w_norm"]),
             "Vs": np.asarray(history["V"]),
             "feasibles": np.asarray(history["feasible"]),
+            "nominal_feasibles": np.asarray(history["nominal_feasible"]),
+            "nominal_violations": np.asarray(history["nominal_violation"]),
+            "LgVs": np.asarray(history["LgV"]),
+            "gradVs": np.asarray(history["gradV"]),
+            "g_col_norms": np.asarray(history["g_col_norms"]),
+            "shield_small_lgv_skips": np.asarray(history["shield_skip_small_lgv"]),
+            "shield_control_deltas": np.asarray(history["shield_control_delta"]),
+            "applied_control_deltas": np.asarray(history["applied_control_delta"]),
+            "shield_projected_residuals": np.asarray(history["shield_projected_residual"]),
+            "applied_robust_residuals": np.asarray(history["applied_robust_residual"]),
+            "true_clf_residuals": np.asarray(history["true_clf_residual"]),
+            "eps_proj": float(eps_proj),
+            "skip_shield_small_lgv": bool(skip_shield_small_lgv),
+            "dt": float(dt),
             "a_true": float(a_true),
         }
 
@@ -181,6 +279,7 @@ def make_metrics_rollout_fn(
     spec, hidden_sizes, adapt_cfg,
     horizon=400, dt=0.05, use_shield=True, policy_obs_dim=None,
     enforce_input_bounds=False, initial_radius=None,
+    eps_proj=0.1, skip_shield_small_lgv=False,
 ):
     """Build a reusable compiled metrics-only rollout.
 
@@ -193,7 +292,7 @@ def make_metrics_rollout_fn(
     if policy_obs_dim is None:
         policy_obs_dim = obs_dim
 
-    clf_cfg = CLFConfig(enabled=use_shield, lambda_clf=lambda_clf, eps_proj=0.1,
+    clf_cfg = CLFConfig(enabled=use_shield, lambda_clf=lambda_clf, eps_proj=eps_proj,
                         enforce_input_bounds=enforce_input_bounds)
     use_observer = adapt_cfg is not None and adapt_cfg.use_observer
     _adapt_cfg = adapt_cfg if adapt_cfg is not None else AdaptiveConfig()
@@ -217,11 +316,12 @@ def make_metrics_rollout_fn(
                              hidden_sizes, out_dim=ctrl_dim)
 
         if use_shield:
-            u, _ = clf_shield(
-                u_nom=u_nom, x=x, adaptive_state=adapt_st,
+            u, _, _ = _apply_eval_shield(
+                u_nom=u_nom, x=x, adapt_st=adapt_st,
                 lyap_params=lyap_params, lyap_cfg=lyap_cfg,
-                clf_cfg=clf_cfg, p=p, affine_terms_fn=affine_fn,
-                alpha_max=0.0,
+                clf_cfg=clf_cfg, p=p, affine_fn=affine_fn,
+                u_min=u_min, u_max=u_max,
+                skip_shield_small_lgv=skip_shield_small_lgv,
             )
         else:
             u = jnp.clip(u_nom, u_min, u_max)
@@ -230,6 +330,8 @@ def make_metrics_rollout_fn(
             adapt_st_next = adaptive_update_observer(
                 adapt_st, x, u, dt, p, _adapt_cfg,
                 affine_terms_fn=affine_fn,
+                dynamics_fn=dynamics_fn,
+                a_true=a_true,
             )
         else:
             adapt_st_next = adapt_st
@@ -263,7 +365,7 @@ def compiled_eval_rollout(
     x0, a_true, policy_params, lyap_params, lyap_cfg, lambda_clf,
     spec, hidden_sizes, adapt_cfg, horizon=400, dt=0.05,
     use_shield=True, policy_obs_dim=None, enforce_input_bounds=False,
-    initial_radius=None,
+    initial_radius=None, eps_proj=0.1, skip_shield_small_lgv=False,
 ):
     """One-off compiled eval rollout. Prefer make_eval_rollout_fn for repeated calls."""
     fn = make_eval_rollout_fn(
@@ -272,6 +374,8 @@ def compiled_eval_rollout(
         horizon, dt, use_shield, policy_obs_dim,
         enforce_input_bounds=enforce_input_bounds,
         initial_radius=initial_radius,
+        eps_proj=eps_proj,
+        skip_shield_small_lgv=skip_shield_small_lgv,
     )
     return fn(x0, a_true)
 
@@ -280,7 +384,7 @@ def metrics_only_rollout(
     x0, a_true, policy_params, lyap_params, lyap_cfg, lambda_clf,
     spec, hidden_sizes, adapt_cfg, horizon=400, dt=0.05,
     use_shield=True, policy_obs_dim=None, enforce_input_bounds=False,
-    initial_radius=None,
+    initial_radius=None, eps_proj=0.1, skip_shield_small_lgv=False,
 ):
     """One-off metrics-only rollout. Prefer make_metrics_rollout_fn for repeated calls."""
     fn = make_metrics_rollout_fn(
@@ -289,6 +393,8 @@ def metrics_only_rollout(
         horizon, dt, use_shield, policy_obs_dim,
         enforce_input_bounds=enforce_input_bounds,
         initial_radius=initial_radius,
+        eps_proj=eps_proj,
+        skip_shield_small_lgv=skip_shield_small_lgv,
     )
     return fn(x0, a_true)
 
@@ -302,6 +408,7 @@ def make_batched_metrics_fn(
     spec, hidden_sizes, adapt_cfg,
     horizon=400, dt=0.05, use_shield=True, policy_obs_dim=None,
     enforce_input_bounds=False, initial_radius=None,
+    eps_proj=0.1, skip_shield_small_lgv=False,
 ):
     """Build a reusable vmap'd metrics rollout.
 
@@ -317,7 +424,7 @@ def make_batched_metrics_fn(
     if policy_obs_dim is None:
         policy_obs_dim = obs_dim
 
-    clf_cfg = CLFConfig(enabled=use_shield, lambda_clf=lambda_clf, eps_proj=0.1,
+    clf_cfg = CLFConfig(enabled=use_shield, lambda_clf=lambda_clf, eps_proj=eps_proj,
                         enforce_input_bounds=enforce_input_bounds)
     use_observer = adapt_cfg is not None and adapt_cfg.use_observer
     _adapt_cfg = adapt_cfg if adapt_cfg is not None else AdaptiveConfig()
@@ -341,11 +448,12 @@ def make_batched_metrics_fn(
                              hidden_sizes, out_dim=ctrl_dim)
 
         if use_shield:
-            u, _ = clf_shield(
-                u_nom=u_nom, x=x, adaptive_state=adapt_st,
+            u, _, _ = _apply_eval_shield(
+                u_nom=u_nom, x=x, adapt_st=adapt_st,
                 lyap_params=lyap_params, lyap_cfg=lyap_cfg,
-                clf_cfg=clf_cfg, p=p, affine_terms_fn=affine_fn,
-                alpha_max=0.0,
+                clf_cfg=clf_cfg, p=p, affine_fn=affine_fn,
+                u_min=u_min, u_max=u_max,
+                skip_shield_small_lgv=skip_shield_small_lgv,
             )
         else:
             u = jnp.clip(u_nom, u_min, u_max)
@@ -354,6 +462,8 @@ def make_batched_metrics_fn(
             adapt_st_next = adaptive_update_observer(
                 adapt_st, x, u, dt, p, _adapt_cfg,
                 affine_terms_fn=affine_fn,
+                dynamics_fn=dynamics_fn,
+                a_true=a_true_c,
             )
         else:
             adapt_st_next = adapt_st
@@ -392,7 +502,7 @@ def batched_metrics_rollout(
     x0s, a_true, policy_params, lyap_params, lyap_cfg, lambda_clf,
     spec, hidden_sizes, adapt_cfg, horizon=400, dt=0.05,
     use_shield=True, policy_obs_dim=None, enforce_input_bounds=False,
-    initial_radius=None,
+    initial_radius=None, eps_proj=0.1, skip_shield_small_lgv=False,
 ):
     """One-off batched metrics rollout. Prefer make_batched_metrics_fn for repeated calls."""
     fn = make_batched_metrics_fn(
@@ -401,5 +511,7 @@ def batched_metrics_rollout(
         horizon, dt, use_shield, policy_obs_dim,
         enforce_input_bounds=enforce_input_bounds,
         initial_radius=initial_radius,
+        eps_proj=eps_proj,
+        skip_shield_small_lgv=skip_shield_small_lgv,
     )
     return fn(x0s, a_true)

@@ -150,6 +150,8 @@ def _run_eval_rollout_eager(
         adapt_st = adaptive_update_observer(
             adapt_st, x, u, dt, p, adapt_cfg,
             affine_terms_fn=affine_fn,
+            dynamics_fn=dynamics_fn,
+            a_true=a_true_arr,
         )
 
         # True dynamics step (RK4)
@@ -179,7 +181,13 @@ def plot_observer_validation(results, save_path=None):
     t = np.arange(len(results["a_hats"]))
     a_true = results["a_true"]
 
-    fig, axes = plt.subplots(3, 3, figsize=(16, 12))
+    LgVs = results.get("LgVs")
+    gradVs = results.get("gradVs")
+    g_col_norms = results.get("g_col_norms")
+    has_decomp = LgVs is not None and gradVs is not None
+    nrows = 5 if has_decomp else (4 if LgVs is not None else 3)
+
+    fig, axes = plt.subplots(nrows, 3, figsize=(16, 4 * nrows))
 
     ax = axes[0, 0]
     ax.plot(t, results["a_hats"], label="a_hat")
@@ -245,6 +253,67 @@ def plot_observer_validation(results, save_path=None):
     ax.set(xlabel="step", ylabel="u", title="Controls")
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
+
+    # Row 3: LgV diagnostics
+    if LgVs is not None:
+        ax = axes[3, 0]
+        LgV_norm = np.linalg.norm(LgVs, axis=-1)
+        ax.plot(t, LgV_norm, color="tab:red")
+        ax.axhline(0.1, color="gray", ls=":", lw=0.8, label="eps_proj=0.1")
+        ax.set(xlabel="step", ylabel="||LgV||", title="||LgV|| (shield authority)")
+        ax.set_yscale("symlog", linthresh=1e-4)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+        ax = axes[3, 1]
+        for j in range(LgVs.shape[-1]):
+            ax.plot(t, LgVs[:, j], label=f"LgV[{j}]", alpha=0.8)
+        ax.set(xlabel="step", ylabel="LgV", title="LgV components")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+        ax = axes[3, 2]
+        ax.plot(t, LgV_norm**2, color="tab:red", label="||LgV||^2")
+        ax.axhline(0.1, color="gray", ls=":", lw=0.8, label="eps_proj")
+        ax.set(xlabel="step", ylabel="||LgV||^2",
+               title="||LgV||^2 vs eps_proj (projection effective above)")
+        ax.set_yscale("symlog", linthresh=1e-4)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+    else:
+        for j in range(3):
+            axes[3, j].set_visible(False)
+
+    # Row 4: gradV / G(x) decomposition
+    if has_decomp:
+        ax = axes[4, 0]
+        gradV_norm = np.linalg.norm(gradVs, axis=-1)
+        ax.plot(t, gradV_norm, color="tab:blue")
+        ax.set(xlabel="step", ylabel="||dV/dx||",
+               title="||dV/dx|| (Lyapunov gradient norm)")
+        ax.set_yscale("symlog", linthresh=1e-4)
+        ax.grid(True, alpha=0.3)
+
+        ax = axes[4, 1]
+        if g_col_norms is not None:
+            for j in range(g_col_norms.shape[-1]):
+                ax.plot(t, g_col_norms[:, j],
+                        label=f"||g_{j}||", alpha=0.8)
+        ax.set(xlabel="step", ylabel="||g_i(x)||",
+               title="G(x) column norms (control effectiveness)")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+        ax = axes[4, 2]
+        for j in range(gradVs.shape[-1]):
+            ax.plot(t, gradVs[:, j], label=f"dV/dx[{j}]", alpha=0.7)
+        ax.set(xlabel="step", ylabel="dV/dx_i",
+               title="dV/dx components")
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+    elif nrows >= 5:
+        for j in range(3):
+            axes[4, j].set_visible(False)
 
     fig.suptitle(
         f"Observer Validation | a_true={a_true} | "

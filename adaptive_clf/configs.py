@@ -175,3 +175,10 @@ class AdaptiveState(NamedTuple):
     x_hat: Array = jnp.zeros(1)   # state predictor estimate (state_dim,)
     w: Array = jnp.zeros(1)       # filter state (state_dim,) for scalar a
     eta: Array = jnp.zeros(1)     # auxiliary signal (state_dim,)
+    # Continuous observer/adaptation states. The controller only sees
+    # (a_hat, radius), which are the last published values that passed the
+    # nesting test. These internal states keep evolving between publications.
+    a_hat_internal: Array = jnp.array(0.0, dtype=jnp.float32)
+    info_internal: Array = jnp.array(0.0, dtype=jnp.float32)
+    q_internal: Array = jnp.array(0.0, dtype=jnp.float32)
+    ve0: Array = jnp.array(0.0, dtype=jnp.float32)
