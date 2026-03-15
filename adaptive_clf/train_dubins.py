@@ -196,6 +196,10 @@ def _episode_rollout(
 
     adaptive_state0 = _init_adaptive(p, adapt_cfg)
     u_eq = jnp.array([p.v_ref, 0.0])
+    u_bounds = (
+        jnp.array([p.v_min, p.omega_min]),
+        jnp.array([p.v_max, p.omega_max]),
+    )
 
     def body(carry, _):
         e_raw, adaptive_state = carry
@@ -231,6 +235,7 @@ def _episode_rollout(
                 clf_cfg=clf_cfg,
                 p=p,
                 affine_terms_fn=dubins_affine_terms,
+                input_bounds=u_bounds,
             )
             # Clip to input bounds
             u = jnp.array([
@@ -648,6 +653,10 @@ def _simulate(policy_params, e0, a_true, p, hidden_sizes, lqr_K,
     use_adapt = adapt_cfg.adapt_enabled
     adaptive_state0 = _init_adaptive(p, adapt_cfg)
     u_eq = jnp.array([p.v_ref, 0.0])
+    u_bounds = (
+        jnp.array([p.v_min, p.omega_min]),
+        jnp.array([p.v_max, p.omega_max]),
+    )
 
     def body(carry, _):
         e_raw, adaptive_state = carry
@@ -672,6 +681,7 @@ def _simulate(policy_params, e0, a_true, p, hidden_sizes, lqr_K,
                 lyap_params=lyap_params, lyap_cfg=lyap_cfg,
                 clf_cfg=clf_cfg, p=p,
                 affine_terms_fn=dubins_affine_terms,
+                input_bounds=u_bounds,
             )
             u = jnp.array([
                 jnp.clip(u_shield[0], p.v_min, p.v_max),

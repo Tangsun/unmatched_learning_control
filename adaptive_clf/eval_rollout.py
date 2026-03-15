@@ -69,6 +69,7 @@ def _apply_eval_shield(
         lyap_params=lyap_params, lyap_cfg=lyap_cfg,
         clf_cfg=clf_cfg, p=p, affine_terms_fn=affine_fn,
         alpha_max=0.0,
+        input_bounds=(u_min, u_max),
     )
     skip_small_lgv = jnp.logical_and(
         skip_shield_small_lgv,

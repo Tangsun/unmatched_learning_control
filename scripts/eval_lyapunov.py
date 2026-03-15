@@ -44,6 +44,7 @@ def rollout_eval(policy_params, lyap_params, lyap_cfg, x0, spec,
                 u_nom=u_nom, x=x, adaptive_state=dummy_adaptive,
                 lyap_params=lyap_params, lyap_cfg=lyap_cfg,
                 clf_cfg=clf_cfg, p=p, affine_terms_fn=affine_fn,
+                input_bounds=(u_min, u_max),
             )
             u = jnp.clip(u, u_min, u_max)
             feasible = float(aux["feasible"])

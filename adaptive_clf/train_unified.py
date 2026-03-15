@@ -168,6 +168,7 @@ def _episode_rollout(
     wrap_fn = spec["wrap_state"]
     affine_fn = spec["affine_terms_fn"]
     dynamics_fn = spec["dynamics_fn"]
+    u_bounds = _get_u_bounds(spec)
 
     if use_adapt:
         adaptive_state0 = init_adaptive_state(p, adapt_cfg)
@@ -190,6 +191,7 @@ def _episode_rollout(
                 u_nom=u_nom, x=x, adaptive_state=adaptive_state,
                 lyap_params=lyap_params, lyap_cfg=lyap_cfg,
                 clf_cfg=clf_cfg, p=p, affine_terms_fn=affine_fn,
+                input_bounds=u_bounds,
             )
             u = _clip_u(u_shield, spec)
             feasible = shield_aux.get("feasible", jnp.array(1.0))

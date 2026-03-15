@@ -205,6 +205,7 @@ def _episode_rollout(
                 clf_cfg=clf_cfg,
                 p=p,
                 affine_terms_fn=cartpole_affine_terms,
+                input_bounds=(p.u_min, p.u_max),
             )
             u = jnp.clip(u_shield, p.u_min, p.u_max)
             feasible = shield_aux.get("feasible", jnp.array(1.0))
@@ -777,6 +778,7 @@ def _simulate(policy_params, x0, p, hidden_sizes, lqr_K, horizon, dt,
                 lyap_params=lyap_params, lyap_cfg=lyap_cfg,
                 clf_cfg=clf_cfg, p=p,
                 affine_terms_fn=cartpole_affine_terms,
+                input_bounds=(p.u_min, p.u_max),
             )
             u = jnp.clip(u_shield, p.u_min, p.u_max)
         else:

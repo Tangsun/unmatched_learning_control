@@ -70,9 +70,10 @@ def init_adaptive_state(p: Any, adapt_cfg: AdaptiveConfig,
         w0 = jnp.zeros(state_dim, dtype=jnp.float32)
         eta0 = jnp.zeros(state_dim, dtype=jnp.float32)
         # info/info_internal store the published/internal V_eη values.
-        # V_eη(0) = ½ z_0² so z_θ^eη(0) = √V_eη(0) = z_0/√2.
-        # This is intentionally < radius_0; the gap provides headroom
-        # for the joint acceptance condition (Algorithm 1).
+        # The paper defines V_{tilde theta} = 1/2 ||tilde theta||^2 and
+        # initializes V_eη(0) = 1/2 z_0². The certified radius is therefore
+        # recovered as sqrt(2 V), not sqrt(V), so the initial candidate radius
+        # is z_0 rather than z_0/sqrt(2).
         V_eη_0 = 0.5 * radius0 ** 2
         return make_adaptive_state(
             a_hat0, V_eη_0, radius0,
@@ -271,21 +272,29 @@ def adaptive_update_observer(state: AdaptiveState,
         k1_q + 2.0 * k2_q + 2.0 * k3_q + k4_q
     )
 
-    z_eη = jnp.sqrt(info_internal_next)  # eq. (15a)
+    z_eη = jnp.sqrt(2.0 * info_internal_next)
     alpha = 1.0 / (1.0 + gamma * q_internal_next)  # eq. (9), scalar case
     V_E = alpha * state.ve0                               # eq. (16b)
-    z_E = jnp.sqrt(V_E)                                  # eq. (16a)
+    z_E = jnp.sqrt(2.0 * V_E)
     r_candidate = jnp.minimum(z_eη, z_E)                 # eq. (14)
 
-    # --- Joint acceptance (Algorithm 1 from Adetola et al. 2009) ---
-    # The continuous observer state keeps evolving, but the controller-facing
-    # (a_hat, radius) pair is only published when the new ball is contained in
-    # the previous published ball: r_new <= r_old - |a_hat_new - a_hat_old|.
-    delta_a = jnp.abs(a_hat_internal_next - state.a_hat)
-    accept = r_candidate <= state.radius - delta_a
-    a_hat_next = jnp.where(accept, a_hat_internal_next, state.a_hat)
-    radius_next = jnp.where(accept, r_candidate, state.radius)
-    info_next = jnp.where(accept, info_internal_next, state.info)
+    publish_mode = getattr(adapt_cfg, "observer_publish_mode", "nested")
+    if publish_mode == "aggressive":
+        # Non-paper mode for diagnostics or aggressive control:
+        # publish the internal certified candidate each step.
+        a_hat_next = a_hat_internal_next
+        radius_next = r_candidate
+        info_next = info_internal_next
+    else:
+        # --- Joint acceptance (Algorithm 1 from Adetola et al. 2009) ---
+        # The continuous observer state keeps evolving, but the controller-facing
+        # (a_hat, radius) pair is only published when the new ball is contained in
+        # the previous published ball: r_new <= r_old - |a_hat_new - a_hat_old|.
+        delta_a = jnp.abs(a_hat_internal_next - state.a_hat)
+        accept = r_candidate <= state.radius - delta_a
+        a_hat_next = jnp.where(accept, a_hat_internal_next, state.a_hat)
+        radius_next = jnp.where(accept, r_candidate, state.radius)
+        info_next = jnp.where(accept, info_internal_next, state.info)
 
     return AdaptiveState(
         a_hat=a_hat_next,

@@ -90,6 +90,7 @@ def _run_eval_rollout_eager(
     spec, hidden_sizes, adapt_cfg, horizon=400, dt=0.05,
     use_shield=True, policy_obs_dim=None,
     eps_proj=0.1, skip_shield_small_lgv=False,
+    initial_radius=None,
 ):
     """Eager fallback for debugging (original Python-loop version)."""
     p = spec["params"]
@@ -109,7 +110,9 @@ def _run_eval_rollout_eager(
 
     use_observer = adapt_cfg is not None and adapt_cfg.use_observer
     if adapt_cfg is not None and adapt_cfg.adapt_enabled:
-        adapt_st = init_adaptive_state(p, adapt_cfg, state_dim=state_dim, x0=x)
+        adapt_st = init_adaptive_state(
+            p, adapt_cfg, state_dim=state_dim, x0=x, a_range=initial_radius,
+        )
     else:
         adapt_st = AdaptiveState(
             a_hat=jnp.array(0.0), info=jnp.array(1e-6),
@@ -142,6 +145,7 @@ def _run_eval_rollout_eager(
                 lyap_params=lyap_params, lyap_cfg=lyap_cfg,
                 clf_cfg=clf_cfg, p=p, affine_terms_fn=affine_fn,
                 alpha_max=0.0,
+                input_bounds=(spec["u_min"], spec["u_max"]),
             )
             if skip_shield_small_lgv and float(shield_aux["a_norm_sq"]) < eps_proj:
                 if ctrl_dim == 1:
@@ -613,7 +617,7 @@ def animate_pvtol(results, dt, save_path, title="",
 # Comparison across runs
 # ---------------------------------------------------------------------------
 
-def compare_runs(run_dirs, a_values, observer_k, observer_gamma,
+def compare_runs(run_dirs, a_values, observer_k, observer_gamma, observer_publish_mode,
                  horizon, dt, n_ics, seed, save_dir):
     """Compare multiple runs across wind values."""
     key = jax.random.PRNGKey(seed)
@@ -640,11 +644,18 @@ def compare_runs(run_dirs, a_values, observer_k, observer_gamma,
     for name, data in models.items():
         use_adapt = data.get("use_adapt", False)
         if use_adapt:
+            saved_adapt_cfg = data.get("adapt_cfg", None)
+            publish_mode = (
+                observer_publish_mode
+                if observer_publish_mode is not None
+                else getattr(saved_adapt_cfg, "observer_publish_mode", "nested")
+            )
             adapt_cfg = AdaptiveConfig(
                 adapt_enabled=True,
                 use_observer=True,
                 observer_k=observer_k,
                 observer_gamma=observer_gamma,
+                observer_publish_mode=publish_mode,
                 stopgrad_obs=True,
             )
         else:
@@ -726,6 +737,9 @@ def main():
                         help="Wind values for comparison")
     parser.add_argument("--observer-k", type=float, default=3.0)
     parser.add_argument("--observer-gamma", type=float, default=20.0)
+    parser.add_argument("--observer-publish-mode", type=str, default=None,
+                        choices=["nested", "aggressive"],
+                        help="Override observer publication mode (default: use saved run config if available)")
     parser.add_argument("--lambda-clf", type=float, default=None,
                         help="Override the saved CLF decay rate for eval")
     parser.add_argument("--horizon", type=int, default=400)
@@ -756,6 +770,7 @@ def main():
             a_values=args.a_values,
             observer_k=args.observer_k,
             observer_gamma=args.observer_gamma,
+            observer_publish_mode=args.observer_publish_mode,
             horizon=args.horizon,
             dt=args.dt,
             n_ics=args.n_ics,
@@ -782,14 +797,22 @@ def main():
     use_adapt = data.get("use_adapt", False)
 
     if use_adapt:
+        saved_adapt_cfg = data.get("adapt_cfg", None)
+        observer_publish_mode = (
+            args.observer_publish_mode
+            if args.observer_publish_mode is not None
+            else getattr(saved_adapt_cfg, "observer_publish_mode", "nested")
+        )
         adapt_cfg = AdaptiveConfig(
             adapt_enabled=True,
             use_observer=True,
             observer_k=args.observer_k,
             observer_gamma=args.observer_gamma,
+            observer_publish_mode=observer_publish_mode,
             stopgrad_obs=True,
         )
     else:
+        observer_publish_mode = "nested"
         adapt_cfg = None
 
     save_dir = args.save_dir or os.path.join(args.run_dir, "eval_pvtol")
@@ -799,7 +822,10 @@ def main():
     x0s, _ = spec["sample_ics"](key, args.n_ics, 1.0, 0.0)
 
     run_name = os.path.basename(args.run_dir)
-    adapt_str = f"observer k={args.observer_k} gamma={args.observer_gamma}" if use_adapt else "no adaptation"
+    adapt_str = (
+        f"observer k={args.observer_k} gamma={args.observer_gamma} publish={observer_publish_mode}"
+        if use_adapt else "no adaptation"
+    )
     print(f"PVTOL eval: {run_name}")
     print(f"  a_wind={args.a_true}, {adapt_str}")
     print(f"  horizon={args.horizon}, dt={args.dt}, {args.n_ics} ICs")

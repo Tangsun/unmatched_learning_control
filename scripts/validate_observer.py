@@ -78,6 +78,7 @@ def _run_eval_rollout_eager(
     x0, a_true, policy_params, lyap_params, lyap_cfg, lambda_clf,
     spec, hidden_sizes, adapt_cfg, horizon=400, dt=0.05,
     use_shield=True, policy_obs_dim=None,
+    initial_radius=None,
 ):
     """Eager fallback for debugging (original Python-loop version)."""
     p = spec["params"]
@@ -95,7 +96,9 @@ def _run_eval_rollout_eager(
     x = jnp.array(x0, dtype=jnp.float32)
     a_true_arr = jnp.asarray(a_true, dtype=jnp.float32)
 
-    adapt_st = init_adaptive_state(p, adapt_cfg, state_dim=state_dim, x0=x)
+    adapt_st = init_adaptive_state(
+        p, adapt_cfg, state_dim=state_dim, x0=x, a_range=initial_radius,
+    )
 
     # Storage
     xs, us, a_hats, radii = [np.array(x)], [], [], []
@@ -127,6 +130,7 @@ def _run_eval_rollout_eager(
                 lyap_params=lyap_params, lyap_cfg=lyap_cfg,
                 clf_cfg=clf_cfg, p=p, affine_terms_fn=affine_fn,
                 alpha_max=0.0,
+                input_bounds=(spec["u_min"], spec["u_max"]) if ctrl_dim > 1 else (p.u_min, p.u_max),
             )
             feasibles.append(float(shield_aux["feasible"]))
             V = shield_aux["V"]
@@ -551,6 +555,9 @@ def main():
                         help="True uncertainty value")
     parser.add_argument("--observer-k", type=float, default=5.0)
     parser.add_argument("--observer-gamma", type=float, default=5.0)
+    parser.add_argument("--observer-publish-mode", type=str, default=None,
+                        choices=["nested", "aggressive"],
+                        help="Override observer publication mode (default: use saved run config if available)")
     parser.add_argument("--horizon", type=int, default=400)
     parser.add_argument("--dt", type=float, default=0.05)
     parser.add_argument("--n-ics", type=int, default=6,
@@ -583,11 +590,19 @@ def main():
     policy_obs_dim = data.get("obs_dim", spec["obs_dim"])
     v_ref = spec["params"].v_ref
 
+    saved_adapt_cfg = data.get("adapt_cfg", None)
+    observer_publish_mode = (
+        args.observer_publish_mode
+        if args.observer_publish_mode is not None
+        else getattr(saved_adapt_cfg, "observer_publish_mode", "nested")
+    )
+
     adapt_cfg = AdaptiveConfig(
         adapt_enabled=True,
         use_observer=True,
         observer_k=args.observer_k,
         observer_gamma=args.observer_gamma,
+        observer_publish_mode=observer_publish_mode,
         stopgrad_obs=True,
     )
 
@@ -599,7 +614,7 @@ def main():
     x0s, _ = spec["sample_ics"](key, args.n_ics, 1.0, 0.0)
 
     print(f"Observer validation: system={system}, a_true={args.a_true}")
-    print(f"  k={args.observer_k}, gamma={args.observer_gamma}")
+    print(f"  k={args.observer_k}, gamma={args.observer_gamma}, publish={observer_publish_mode}")
     print(f"  horizon={args.horizon}, dt={args.dt}")
     print(f"  shield={'OFF' if args.no_shield else 'ON'}"
           f"{' (input bounds enforced)' if args.enforce_input_bounds else ''}")

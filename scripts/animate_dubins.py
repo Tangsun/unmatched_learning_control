@@ -86,6 +86,7 @@ def simulate_dubins(policy_params, lyap_params, lyap_cfg, x0, spec, data,
                 u_nom=u_nom, x=x, adaptive_state=adapt_state,
                 lyap_params=lyap_params, lyap_cfg=lyap_cfg,
                 clf_cfg=clf_cfg, p=p, affine_terms_fn=affine_fn,
+                input_bounds=(u_lo, u_hi),
             )
             u = jnp.clip(u, u_lo, u_hi)
         else:

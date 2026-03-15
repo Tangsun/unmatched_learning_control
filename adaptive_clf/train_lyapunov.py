@@ -2,8 +2,9 @@
 
 Train a policy and MLP-PSD Lyapunov function from scratch. Uses a smooth
 CLF violation penalty (relu(Vdot + lambda*V)^2) instead of hard projection
-during training. Region curriculum expands from a small neighborhood to
-the full state space.
+during training. Optionally adds a one-step sampled-data penalty on
+V(x_{k+1}) - (1 - c dt) V(x_k) to reduce sample-and-hold failures.
+Region curriculum expands from a small neighborhood to the full state space.
 
 Usage:
     # Small region, no shield (V-fitting + policy)
@@ -77,6 +78,9 @@ def _episode_rollout_lyap(
     use_shield: bool,
     lambda_clf: float,
     w_violation: float,
+    w_sampled: float,
+    sampled_decay: float,
+    sampled_loss_on: str,
     policy_mode: str,
     adapt_cfg: AdaptiveConfig | None = None,
     shield_diff: bool = False,
@@ -90,6 +94,7 @@ def _episode_rollout_lyap(
     affine_fn = spec["affine_terms_fn"]
     dynamics_fn = spec["dynamics_fn"]
     make_obs = spec["make_obs"]
+    u_bounds = _get_u_bounds(spec)
     use_adapt = adapt_cfg is not None and adapt_cfg.adapt_enabled
     state_dim = spec["state_dim"]
     use_observer = use_adapt and adapt_cfg.use_observer
@@ -130,6 +135,7 @@ def _episode_rollout_lyap(
                 lyap_params=lyap_params, lyap_cfg=lyap_cfg,
                 clf_cfg=clf_cfg, p=p, affine_terms_fn=affine_fn,
                 alpha_max=alpha_max,
+                input_bounds=u_bounds,
             )
             if shield_diff:
                 # Differentiable shield: gradients flow through projection
@@ -141,11 +147,22 @@ def _episode_rollout_lyap(
             u = _clip_u(u_nom, spec)
             feasible = jnp.array(1.0)
 
-        # Smooth Vdot violation (computed on u_nom, not shielded u)
+        # Smooth continuous-time CLF violation, computed on clipped u_nom.
         V, gradV = lyapunov_value_and_grad(lyap_params, lyap_cfg, x)
         xdot_nom = dynamics_fn(x, _clip_u(u_nom, spec), a_true, p)
         Vdot = gradV @ xdot_nom
         violation = jax.nn.relu(Vdot + lambda_clf * V) ** 2
+
+        # Optional one-step sampled-data decrease penalty.
+        if sampled_loss_on == "applied":
+            u_sampled = u
+        else:
+            u_sampled = _clip_u(u_nom, spec)
+        x_next_pred = rk4_step_generic(dynamics_fn, x, u_sampled, a_true, dt, p)
+        x_next_pred = wrap_fn(x_next_pred)
+        V_next_pred, _ = lyapunov_value_and_grad(lyap_params, lyap_cfg, x_next_pred)
+        sampled_factor = jnp.maximum(0.0, 1.0 - sampled_decay * dt)
+        sampled_violation = jax.nn.relu(V_next_pred - sampled_factor * V) ** 2
 
         # Feasibility loss (skip when shield_diff with unconstrained u —
         # the halfspace is always feasible)
@@ -171,6 +188,7 @@ def _episode_rollout_lyap(
 
         step_cost = (state_cost + u_cost + proj_cost
                      + w_violation * violation
+                     + w_sampled * sampled_violation
                      + w_violation * feas_penalty)
 
         # Adaptive update (stop_gradient so no backprop through estimator)
@@ -191,9 +209,11 @@ def _episode_rollout_lyap(
             adapt_next = adapt_st
 
         x_next = rk4_step_generic(dynamics_fn, x, u, a_true, dt, p)
-        return (x_next, adapt_next), (step_cost, violation, V, feasible)
+        return (x_next, adapt_next), (
+            step_cost, violation, sampled_violation, V, feasible
+        )
 
-    (xT, _), (costs, violations, Vs, feasibles) = jax.lax.scan(
+    (xT, _), (costs, violations, sampled_violations, Vs, feasibles) = jax.lax.scan(
         body, (x0, adapt_state0), jnp.arange(horizon))
     xT = wrap_fn(xT)
 
@@ -205,6 +225,7 @@ def _episode_rollout_lyap(
         "loss": total_loss,
         "terminal_norm": jnp.linalg.norm(xT),
         "mean_violation": jnp.mean(violations),
+        "mean_sampled_violation": jnp.mean(sampled_violations),
         "mean_V": jnp.mean(Vs),
         "mean_feasible": jnp.mean(feasibles),
     }
@@ -215,7 +236,8 @@ def _batched_loss_lyap(
     policy_params, lyap_params, batch_x0, batch_a,
     spec, hidden_sizes, lqr_K, horizon, dt,
     cost_cfg, lyap_cfg, clf_cfg,
-    use_shield, lambda_clf, w_violation, policy_mode,
+    use_shield, lambda_clf, w_violation, w_sampled, sampled_decay,
+    sampled_loss_on, policy_mode,
     adapt_cfg=None, shield_diff=False, alpha_max=0.0,
     a_range=0.0,
 ):
@@ -224,7 +246,8 @@ def _batched_loss_lyap(
             policy_params, lyap_params, x0, a_true,
             spec, hidden_sizes, lqr_K, horizon, dt,
             cost_cfg, lyap_cfg, clf_cfg,
-            use_shield, lambda_clf, w_violation, policy_mode,
+            use_shield, lambda_clf, w_violation, w_sampled,
+            sampled_decay, sampled_loss_on, policy_mode,
             adapt_cfg=adapt_cfg, shield_diff=shield_diff,
             alpha_max=alpha_max, a_range=a_range,
         )
@@ -253,6 +276,10 @@ def train_lyapunov(
     lambda_clf: float = 0.1,
     w_violation_start: float = 50.0,
     w_violation_end: float = 5.0,
+    w_sampled_start: float = 0.0,
+    w_sampled_end: float = 0.0,
+    sampled_decay: float = 0.0,
+    sampled_loss_on: str = "nominal",
     lyap_hidden: Tuple[int, ...] = (64, 64),
     use_shield: bool = False,
     shield_diff: bool = False,
@@ -270,6 +297,7 @@ def train_lyapunov(
     use_observer: bool = False,
     observer_k: float = 5.0,
     observer_gamma: float = 5.0,
+    observer_publish_mode: str = "nested",
     # Shield projection gain cap (0 = no cap)
     alpha_max: float = 0.0,
     # Freeze Lyapunov (train policy only)
@@ -300,6 +328,7 @@ def train_lyapunov(
         use_observer=use_observer,
         observer_k=observer_k,
         observer_gamma=observer_gamma,
+        observer_publish_mode=observer_publish_mode,
     ) if use_adapt else None
 
     # LQR
@@ -392,7 +421,7 @@ def train_lyapunov(
         return {**lyap_static, "phi": phi}
 
     @jax.jit
-    def step_fn(all_params, opt_state, batch_x0, batch_a, w_violation):
+    def step_fn(all_params, opt_state, batch_x0, batch_a, w_violation, w_sampled):
         def loss_fn(params):
             phi = params["lyap_phi"]
             if freeze_lyap:
@@ -402,7 +431,8 @@ def train_lyapunov(
                 params["policy"], lp, batch_x0, batch_a,
                 spec, hidden_sizes, lqr_K, horizon, dt,
                 cost_cfg, lyap_cfg, clf_cfg,
-                use_shield, lambda_clf, w_violation, policy_mode,
+                use_shield, lambda_clf, w_violation, w_sampled,
+                sampled_decay, sampled_loss_on, policy_mode,
                 adapt_cfg=adapt_cfg, shield_diff=shield_diff,
                 alpha_max=alpha_max, a_range=a_range,
             )
@@ -424,6 +454,11 @@ def train_lyapunov(
           f"{steps_per_epoch} steps/epoch")
     print(f"  lr={lr}, grad_clip={max_grad_norm}")
     print(f"  lambda_clf={lambda_clf}, w_violation={w_violation_start} -> {w_violation_end}")
+    if w_sampled_start > 0.0 or w_sampled_end > 0.0:
+        print(
+            f"  sampled V loss: {w_sampled_start} -> {w_sampled_end} "
+            f"(decay={sampled_decay}, on={sampled_loss_on})"
+        )
     lyap_str = f"MLP-PSD {lyap_hidden}" + (" (FROZEN)" if freeze_lyap else "")
     print(f"  V network: {lyap_str}")
     shield_str = "OFF"
@@ -438,7 +473,10 @@ def train_lyapunov(
     print(f"  Uncertainty: {a_str}")
     if use_adapt:
         if use_observer:
-            print(f"  Adaptive: OBSERVER (k={observer_k}, gamma={observer_gamma}, obs_dim={obs_dim})")
+            print(
+                f"  Adaptive: OBSERVER (k={observer_k}, gamma={observer_gamma}, "
+                f"publish={observer_publish_mode}, obs_dim={obs_dim})"
+            )
         else:
             print(f"  Adaptive: HEURISTIC (eta={adapt_eta}, obs_dim={obs_dim})")
     print(f"  Saving to: {save_dir}")
@@ -463,6 +501,8 @@ def train_lyapunov(
         t_frac = (epoch - 1) / max(1, epochs - 1)
         w_violation = w_violation_start + (w_violation_end - w_violation_start) * t_frac
         w_violation_jax = jnp.float32(w_violation)
+        w_sampled = w_sampled_start + (w_sampled_end - w_sampled_start) * t_frac
+        w_sampled_jax = jnp.float32(w_sampled)
 
         # Sample ICs
         key, pool_key, a_key = jax.random.split(key, 3)
@@ -476,6 +516,7 @@ def train_lyapunov(
         epoch_grad = 0.0
         epoch_term = 0.0
         epoch_viol = 0.0
+        epoch_sampled_viol = 0.0
         epoch_feas = 0.0
         epoch_V = 0.0
 
@@ -485,19 +526,22 @@ def train_lyapunov(
             batch_a = pool_a[idx:idx + batch_size]
 
             all_params, opt_state, loss, metrics = step_fn(
-                all_params, opt_state, batch_x0, batch_a, w_violation_jax)
+                all_params, opt_state, batch_x0, batch_a,
+                w_violation_jax, w_sampled_jax)
 
             epoch_loss += float(loss)
             epoch_grad += float(metrics.get("grad_norm", 0.0))
             epoch_term += float(metrics.get("terminal_norm", 0.0))
             epoch_viol += float(metrics.get("mean_violation", 0.0))
+            epoch_sampled_viol += float(metrics.get("mean_sampled_violation", 0.0))
             epoch_feas += float(metrics.get("mean_feasible", 1.0))
             epoch_V += float(metrics.get("mean_V", 0.0))
 
             global_step = (epoch - 1) * steps_per_epoch + step_i + 1
             record = {"step": global_step, "epoch": epoch,
                       "region_scale": region_scale,
-                      "w_violation": w_violation}
+                      "w_violation": w_violation,
+                      "w_sampled": w_sampled}
             for k, v in metrics.items():
                 record[k] = float(v)
             history.append(record)
@@ -507,6 +551,7 @@ def train_lyapunov(
         avg_grad = epoch_grad / n
         avg_term = epoch_term / n
         avg_viol = epoch_viol / n
+        avg_sampled_viol = epoch_sampled_viol / n
         avg_feas = epoch_feas / n
         avg_V = epoch_V / n
 
@@ -522,10 +567,12 @@ def train_lyapunov(
                 f"loss {avg_loss:9.3f} | "
                 f"term {avg_term:6.2f} | "
                 f"viol {avg_viol:8.5f} | "
+                f"sviol {avg_sampled_viol:8.5f} | "
                 f"{feas_str}"
                 f"V {avg_V:7.4f} | "
                 f"r={region_scale:.2f} | "
                 f"wv={w_violation:.1f} | "
+                f"ws={w_sampled:.1f} | "
                 f"grad {avg_grad:8.2f} | "
                 f"{elapsed:.1f}s"
             )
@@ -571,11 +618,16 @@ def train_lyapunov(
         "lambda_clf": lambda_clf,
         "w_violation_start": w_violation_start,
         "w_violation_end": w_violation_end,
+        "w_sampled_start": w_sampled_start,
+        "w_sampled_end": w_sampled_end,
+        "sampled_decay": sampled_decay,
+        "sampled_loss_on": sampled_loss_on,
         "lyap_hidden": lyap_hidden, "use_shield": use_shield,
         "region_start": region_start, "region_end": region_end,
         "curriculum_frac": curriculum_frac,
         "a_true": a_true, "a_range": a_range,
         "use_adapt": use_adapt, "adapt_eta": adapt_eta,
+        "observer_publish_mode": observer_publish_mode,
         "warmstart_from": warmstart_from,
         "seed": seed,
     }
@@ -597,13 +649,16 @@ def _plot_training_lyap(history: list, save_dir: str,
     steps = [h["step"] for h in history]
     losses = [h["loss"] for h in history]
     viols = [h.get("mean_violation", 0) for h in history]
+    sampled_viols = [h.get("mean_sampled_violation", 0) for h in history]
     norms = [h.get("terminal_norm", 0) for h in history]
     Vs = [h.get("mean_V", 0) for h in history]
     regions = [h.get("region_scale", 0.3) for h in history]
+    w_viols = [h.get("w_violation", 0) for h in history]
+    w_samplings = [h.get("w_sampled", 0) for h in history]
 
-    ncols = 3
+    ncols = 4
     nrows = 2
-    fig, axes = plt.subplots(nrows, ncols, figsize=(15, 8))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(18, 8))
 
     # Loss
     axes[0, 0].plot(steps, losses)
@@ -622,6 +677,13 @@ def _plot_training_lyap(history: list, save_dir: str,
                     title="CLF violation (smooth)")
     axes[0, 2].set_yscale("symlog", linthresh=1e-6)
     axes[0, 2].grid(True, alpha=0.3)
+
+    # Sampled-data violation
+    axes[0, 3].plot(steps, sampled_viols, color="tab:cyan")
+    axes[0, 3].set(xlabel="step", ylabel="sampled viol",
+                    title="Sampled V violation")
+    axes[0, 3].set_yscale("symlog", linthresh=1e-6)
+    axes[0, 3].grid(True, alpha=0.3)
 
     # Mean V
     axes[1, 0].plot(steps, Vs, color="tab:purple")
@@ -647,6 +709,13 @@ def _plot_training_lyap(history: list, save_dir: str,
     axes[1, 2].set(xlabel="step", ylabel="region_scale",
                     title="Region curriculum")
     axes[1, 2].grid(True, alpha=0.3)
+
+    # Loss weights
+    axes[1, 3].plot(steps, w_viols, label="w_violation", color="tab:red")
+    axes[1, 3].plot(steps, w_samplings, label="w_sampled", color="tab:cyan")
+    axes[1, 3].set(xlabel="step", ylabel="weight", title="Loss weights")
+    axes[1, 3].grid(True, alpha=0.3)
+    axes[1, 3].legend(fontsize=8)
 
     fig.tight_layout()
     out = os.path.join(save_dir, "training_curve.png")
@@ -678,6 +747,15 @@ def main():
                         help="Violation weight at start (high to shape V)")
     parser.add_argument("--w-violation-end", type=float, default=5.0,
                         help="Violation weight at end (low to focus on control)")
+    parser.add_argument("--w-sampled-start", type=float, default=0.0,
+                        help="Sampled-data V decrease weight at start")
+    parser.add_argument("--w-sampled-end", type=float, default=0.0,
+                        help="Sampled-data V decrease weight at end")
+    parser.add_argument("--sampled-decay", type=float, default=0.0,
+                        help="One-step target: V(x+) <= (1 - sampled_decay*dt) V(x)")
+    parser.add_argument("--sampled-loss-on", type=str, default="nominal",
+                        choices=["nominal", "applied"],
+                        help="Use clipped nominal or applied control in sampled V loss")
     parser.add_argument("--lyap-hidden", type=int, nargs="+", default=[64, 64])
     parser.add_argument("--shield", action="store_true",
                         help="Enable CLF shield projection during training")
@@ -702,6 +780,9 @@ def main():
                         help="Observer gain (eigenvalue of eta decay)")
     parser.add_argument("--observer-gamma", type=float, default=5.0,
                         help="Observer adaptation gain for a_hat update")
+    parser.add_argument("--observer-publish-mode", type=str, default="nested",
+                        choices=["nested", "aggressive"],
+                        help="Observer publication mode: paper nested set update or aggressive publish-every-step")
     parser.add_argument("--freeze-lyap", action="store_true",
                         help="Freeze Lyapunov params (train policy only)")
     parser.add_argument("--warmstart-from", type=str, default=None,
@@ -726,6 +807,10 @@ def main():
         lambda_clf=args.lambda_clf,
         w_violation_start=args.w_violation_start,
         w_violation_end=args.w_violation_end,
+        w_sampled_start=args.w_sampled_start,
+        w_sampled_end=args.w_sampled_end,
+        sampled_decay=args.sampled_decay,
+        sampled_loss_on=args.sampled_loss_on,
         lyap_hidden=tuple(args.lyap_hidden),
         use_shield=args.shield or args.shield_diff,
         shield_diff=args.shield_diff,
@@ -740,6 +825,7 @@ def main():
         use_observer=args.observer,
         observer_k=args.observer_k,
         observer_gamma=args.observer_gamma,
+        observer_publish_mode=args.observer_publish_mode,
         freeze_lyap=args.freeze_lyap,
         warmstart_from=args.warmstart_from,
         warmstart_lyap_only=args.warmstart_lyap_only,

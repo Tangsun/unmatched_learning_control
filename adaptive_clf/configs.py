@@ -75,6 +75,7 @@ class AdaptiveConfig:
     use_observer: bool = False
     observer_k: float = 5.0       # observer/filter gain (eigenvalue of eta decay)
     observer_gamma: float = 5.0   # adaptation gain for a_hat update
+    observer_publish_mode: str = "nested"  # "nested" (paper) or "aggressive" (publish internal set every step)
     observer_radius_margin: float = 0.01  # safety margin added to radius estimate
     observer_eps_w: float = 0.01  # floor for ||w||^2 in radius computation
 

@@ -1,334 +1,302 @@
 # Parameter Estimation Pipeline
 
-This document describes the observer-based adaptive parameter estimation used
-in our CLF-shield framework. The estimator runs online during both training
-and evaluation, providing the shield with an uncertainty set `B(a_hat, radius)`
-that (after the fix below) is guaranteed to contain the true parameter `a_true`.
+This document describes the current observer-based adaptive parameter
+estimator used by the CLF shield.
 
-Reference: Adetola, DeHaan, Guay, "Adaptive model predictive control for
-constrained nonlinear systems", Systems & Control Letters 58 (2009) 320–326.
+The implementation is intended to match the estimator and set-update logic
+from:
 
----
+Adetola, DeHaan, Guay, "Adaptive model predictive control for constrained
+nonlinear systems", Systems & Control Letters 58 (2009) 320-326.
+
+Scope note:
+- This document covers the estimator only.
+- The controller in this repo is still a learned policy plus CLF shield, not
+  the MPC law from the paper.
 
 ## 1. System Assumption
 
 The plant is control-affine with scalar unknown parameter `a`:
 
-```
+```text
 x_dot = f(x) + G(x) @ u + Y(x) * a
 ```
 
-where `f(x)`, `G(x)`, `Y(x)` are known (from `affine_terms_fn`), and `a` is
-an unknown constant. The parameter lies in a known bounded set
-`a ∈ [a_min, a_max]`.
+where `f(x)`, `G(x)`, and `Y(x)` are known through `affine_terms_fn`, and
+`a` is an unknown constant contained in a known initial interval.
 
-## 2. State Variables
+## 2. What Was Fixed
 
-Defined in `AdaptiveState` (NamedTuple, valid JAX pytree):
+The previous observer path had three structural mismatches with the paper:
 
-| Field    | Shape         | Description                                     |
-|----------|---------------|-------------------------------------------------|
-| `a_hat`  | scalar        | Current parameter estimate                      |
-| `radius` | scalar        | Half-width of uncertainty set `B(a_hat, radius)` |
-| `x_hat`  | `(state_dim,)` | State predictor estimate                       |
-| `w`      | `(state_dim,)` | Filter state                                   |
-| `eta`    | `(state_dim,)` | Auxiliary signal (transient from initial error) |
-| `info`   | scalar        | Accumulated `||Y||^2` (diagnostic only)         |
+1. The predictor omitted the `w * a_hat_dot` term, so the paper identity
+   `e - eta = w * (a_true - a_hat)` no longer held.
+2. The code used only the `z_theta^{e eta}` branch from eq. (15), but not
+   the excitation-side branch `z_theta^E` from eq. (16).
+3. Rejected set updates froze the whole observer state instead of only
+   freezing the published controller-facing set.
 
-## 3. Initialization
+The current implementation fixes those issues:
 
-`init_adaptive_state(p, adapt_cfg, state_dim, x0, a_range)`:
+1. The predictor now uses
+   `x_hat_dot = f + G u + Y a_hat + w a_hat_dot + k e`.
+2. The estimator now tracks both `V_{e eta}` and `Q`, and publishes
+   `z_theta = min(z_theta^{e eta}, z_theta^E)` as in eqs. (14)-(16).
+3. The internal continuous observer keeps evolving every step. Only the
+   published `(a_hat, radius)` pair is gated by the paper's nesting test.
 
-- `a_hat(0) = 0` (or midpoint of `[a_min, a_max]` if `a_range` not given)
-- `radius(0) = a_range` (or `(a_max - a_min) / 2`)
-- `x_hat(0) = x0` so that prediction error `e(0) = x - x_hat = 0`
-- `w(0) = 0`, `eta(0) = 0`
+## 3. State Variables
 
-The initial ball `B(a_hat(0), radius(0))` must contain `a_true`.
+`AdaptiveState` now has two layers of state:
 
-## 4. Observer Dynamics
+### Published state used by the controller
 
-Each timestep, `adaptive_update_observer` computes:
+| Field | Meaning |
+|---|---|
+| `a_hat` | Published parameter estimate |
+| `radius` | Published uncertainty radius |
+| `info` | Published `V_{e eta}` value associated with `a_hat` |
 
-### 4.1 Prediction Error
+The shield only reads these published quantities.
 
+### Internal continuous observer state
+
+| Field | Meaning |
+|---|---|
+| `x_hat` | Predictor state |
+| `w` | Filter state from eq. (3) |
+| `eta` | Auxiliary state from eq. (6) |
+| `a_hat_internal` | Continuously evolving estimate |
+| `info_internal` | Continuously evolving `V_{e eta}` from eq. (15b) |
+| `q_internal` | Continuously evolving `Q` from eq. (8) |
+| `ve0` | Initial `V_E(t_0)` / `V_{e eta}(t_0)` constant used by eq. (16) |
+
+This split is the key fix. The paper's internal estimator and the controller's
+published uncertainty set are not the same object.
+
+## 4. Initialization
+
+`init_adaptive_state(...)` sets:
+
+```text
+a_hat(0) = 0                      if a_range is given
+a_hat(0) = (a_min + a_max) / 2    otherwise
+
+radius(0) = a_range               if a_range is given
+radius(0) = (a_max - a_min) / 2   otherwise
 ```
+
+Observer state:
+
+```text
+x_hat(0) = x(0)
+w(0) = 0
+eta(0) = 0
+```
+
+The Lyapunov/set state is initialized as:
+
+```text
+V_{e eta}(0) = 0.5 * radius(0)^2
+Q(0) = 0
+V_E(0) = V_{e eta}(0)
+```
+
+Because `V_{tilde a} = 0.5 * |a_true - a_hat|^2`, the certified radius must be
+recovered as `sqrt(2V)`. So the internal paper candidate starts at:
+
+```text
+z_theta^{e eta}(0) = sqrt(2 * V_{e eta}(0)) = radius(0)
+```
+
+and likewise `z_theta^E(0) = radius(0)`.
+
+Implementation note:
+- Some OCR/text extractions of the PDF make eqs. (15a) and (16a) look like
+  `z = sqrt(V)`.
+- That scaling is inconsistent with Lemma 2's inclusion proof because the paper
+  defines `V_{tilde a} = 0.5 * |tilde a|^2`.
+- The implementation therefore uses `z = sqrt(2V)`, which preserves
+  `|a_true - a_hat| <= radius` when the paper inequalities hold.
+
+The initial published ball must contain `a_true`.
+
+## 5. Continuous-Time Observer
+
+At each step, the estimator uses the measured state `x` and control `u`.
+
+Define:
+
+```text
 e = x - x_hat
-```
-
-### 4.2 Auxiliary Signal (exponential integrator, exact)
-
-```
-eta(t+dt) = eta(t) * exp(-k * dt)
-```
-
-Decays the initial transient `eta(0) = e(0)` to zero. After decay,
-`e - eta` isolates the component of prediction error due to parameter
-mismatch (not initial conditions).
-
-### 4.3 Filter (exponential integrator, exact for constant Y)
-
-```
-w(t+dt) = w(t) * exp(-k*dt) + Y(x)/k * (1 - exp(-k*dt))
-```
-
-The filter `w` tracks the regressor `Y(x)` with time constant `1/k`.
-In steady state, `w ≈ Y(x)/k`. The filtered innovation `w^T(e - eta)`
-approximates `||w||^2 * a_tilde` where `a_tilde = a_true - a_hat`.
-
-### 4.4 State Predictor (Euler)
-
-```
-x_hat_dot = f(x) + G(x) @ u + Y(x) * a_hat + k * e
-x_hat(t+dt) = x_hat(t) + x_hat_dot * dt
-```
-
-The `k * e` injection drives `x_hat → x`. The predictor uses the current
-`a_hat`, so any mismatch `a_tilde` produces a persistent prediction error
-`e` that the filter extracts.
-
-### 4.5 Parameter Update
-
-```
 innovation = e - eta
+```
+
+The internal observer ODE matches the paper:
+
+```text
 a_hat_dot = gamma * w^T * innovation
-a_hat_candidate = a_hat + a_hat_dot * dt
-a_hat_candidate = clip(a_hat_candidate, a_min, a_max)
+
+x_hat_dot = f(x) + G(x) @ u + Y(x) * a_hat + w * a_hat_dot + k * e
+w_dot     = Y(x) - k * w
+eta_dot   = -k * eta
+V_{e eta}_dot = -gamma * ||innovation||^2
+Q_dot     = ||w||^2
 ```
 
-### 4.6 Lyapunov-Based Radius Bound (eq 15a-b)
+Implementation note:
+- The code integrates this ODE with RK4.
+- If `dynamics_fn` and `a_true` are available, the RK4 stages also move the
+  measured state `x(t)` along the simulated plant during the sample interval.
+  This matches the paper's continuous-time estimator more closely than
+  freezing `x` over `dt`.
 
-The `info` field stores `V_eη`, a Lyapunov energy (eq 15b).
+## 6. Set Update from Eqs. (14)-(16)
 
-```
-V_eη_candidate = V_eη - gamma * ||innovation||² * dt
-V_eη_candidate = max(V_eη_candidate, 0)
-r_candidate = sqrt(V_eη_candidate)              (eq 15a: z_θ^eη = √V_eη)
-```
+After the RK4 step, the code computes the two paper radii:
 
-Note: `z_θ^eη(0) = √(½ z_0²) = z_0/√2 ≈ 0.707·z_0`, intentionally smaller
-than the initial radius `z_0`. The gap `z_0 - z_0/√2 ≈ 0.293·z_0` provides
-headroom for the joint acceptance condition.
-
-### 4.7 Joint Acceptance (Algorithm 1 from Adetola et al. 2009)
-
-Only publish `(a_hat, radius, V_eη)` when the new ball is contained in the
-old ball:
-
-```
-delta_a = |a_hat_candidate - a_hat|
-accept = (r_candidate <= radius - delta_a)
-
-a_hat_next   = a_hat_candidate  if accept, else a_hat
-radius_next  = r_candidate      if accept, else radius
-V_eη_next    = V_eη_candidate   if accept, else V_eη
-radius_next  = max(radius_next, radius_floor)
+```text
+z_theta^{e eta} = sqrt(2 * V_{e eta})
+alpha           = 1 / (1 + gamma * Q)             (scalar case of eq. 9)
+V_E             = alpha * V_E(t_0)                (eq. 16b)
+z_theta^E       = sqrt(2 * V_E)
+z_theta         = min(z_theta^{e eta}, z_theta^E) (eq. 14)
 ```
 
-`V_eη` is frozen on rejection to stay synchronized with `a_hat`.
+The internal candidate set is therefore:
 
-## 5. Hyperparameters
-
-| Parameter               | Default | Description                                    |
-|-------------------------|---------|------------------------------------------------|
-| `observer_k`            | 5.0     | Observer gain (prediction error injection rate) |
-| `observer_gamma`        | 5.0     | Adaptation gain for `a_hat` update             |
-| `observer_eps_w`        | 0.01    | Floor for `||w||^2` in radius computation      |
-| `observer_radius_margin`| 0.01    | Safety margin added to radius estimate         |
-| `radius_floor`          | 0.001   | Absolute minimum radius                        |
-
-Eval scripts expose `--observer-k` and `--observer-gamma` for tuning.
-
-## 6. How the Shield Uses the Estimate
-
-The CLF shield enforces:
-
+```text
+B(a_hat_internal_next, r_candidate)
 ```
+
+with:
+
+```text
+r_candidate = min(z_theta^{e eta}, z_theta^E)
+```
+
+## 7. Published Set Update (Algorithm 1)
+
+The controller-facing `(a_hat, radius)` pair is only updated if the new ball
+is contained in the old published ball:
+
+```text
+delta_a = |a_hat_internal_next - a_hat_published|
+accept  = (r_candidate <= radius_published - delta_a)
+```
+
+If accepted:
+
+```text
+a_hat_next = a_hat_internal_next
+radius_next = r_candidate
+info_next = V_{e eta, internal next}
+```
+
+If rejected:
+
+```text
+a_hat_next = a_hat_published
+radius_next = radius_published
+info_next = info_published
+```
+
+Critically:
+- rejection does not freeze `x_hat`, `w`, `eta`, `a_hat_internal`,
+  `info_internal`, or `q_internal`
+- it only freezes the published set seen by the shield
+
+That is the intended hybrid structure from the paper.
+
+## 8. What the Shield Uses
+
+The robust CLF shield uses the published ball only:
+
+```text
 LgV^T u <= -lambda * V - LfV - LyV * a_hat - |LyV| * radius
 ```
 
-This guarantees `V_dot <= -lambda * V` **if and only if**
-`a_true ∈ B(a_hat, radius)`. The proof:
+So the shield's guarantee is only as good as the published invariant:
 
-```
-V_dot = LfV + LgV^T u + LyV * a_true
-     <= LfV + (-lambda*V - LfV - LyV*a_hat - |LyV|*radius) + LyV*a_true
-      = -lambda*V + LyV*(a_true - a_hat) - |LyV|*radius
+```text
+a_true in B(a_hat, radius)
 ```
 
-When `|a_true - a_hat| <= radius`: `LyV*(a_true - a_hat) <= |LyV|*radius`,
-so `V_dot <= -lambda * V`.
+The estimator fixes above were specifically made to restore that invariant.
 
----
+## 9. Guarantees and Practical Caveat
 
-## 7. Bug History
+### Paper guarantee
 
-### v1: Independent Update (original)
+Under the paper's continuous-time assumptions, if:
 
-```python
-a_hat_next = a_hat + a_hat_dot * dt                   # always updates
-r_candidate = |a_tilde_est| + margin                   # heuristic point estimate
-radius_next = min(radius, r_candidate)                 # monotonic shrink
+```text
+a_true in B(a_hat(t_0), radius(t_0))
 ```
 
-**Two independent bugs**:
+then the published set remains valid for all later times.
 
-1. **`a_hat` and `radius` updated independently** — when `a_hat` jumps,
-   the new ball `B(a_hat_new, radius_new)` can fail to contain `a_true`
-   because the radius didn't account for the center movement.
+The logic is:
 
-2. **`r_candidate` is a heuristic point estimate** — computed as
-   `|w^T(e-eta) / ||w||^2| + margin`. This estimates `|a_tilde|` from a
-   single-step snapshot of the innovation signal. It can dramatically
-   **underestimate** the true error (e.g. when `w` happens to be
-   near-orthogonal to the actual error direction).
+1. `V_{e eta}` and `V_E` each produce valid shrinking parameter bounds.
+2. `z_theta = min(z_theta^{e eta}, z_theta^E)` is still valid.
+3. Algorithm 1 only publishes nested sets.
 
-### v2: Joint Acceptance Only (intermediate fix — still broken)
+### Repo caveat
 
-```python
-# Same heuristic radius as v1, but with joint acceptance
-accept = (r_candidate <= radius - |delta_a|)
-a_hat_next   = a_hat_candidate  if accept  else a_hat
-radius_next  = r_candidate      if accept  else radius
+The repo implementation is still a discrete-time RK4 approximation of the
+continuous-time proof. So the paper's theorem is not reproduced in a literal
+mathematical sense. What was fixed is the structural mismatch:
+
+- correct predictor dynamics
+- correct internal/public split
+- correct eq. (14)-(16) radius logic
+- correct publication rule
+
+In practice this removes the earlier large containment failures. Any remaining
+violations should now be at numerical-discretization scale rather than from
+the wrong estimator logic.
+
+## 10. Previous Broken Versions
+
+For reference, the older observer path had the following issues.
+
+### v1: Heuristic point-estimate radius
+
+The first version used a single-step heuristic for the radius and updated
+`a_hat` and `radius` independently. This could publish a ball that did not
+contain `a_true`.
+
+### v2: Joint acceptance without a valid radius
+
+The second version added a nesting test but still used a bad radius estimate.
+This prevented geometric "splitting" of the ball, but could still accept
+a grossly underestimated set.
+
+### v3: Current paper-aligned estimator
+
+The current version replaces the heuristic radius with the paper's
+`min(z_theta^{e eta}, z_theta^E)` construction and only publishes nested sets,
+while letting the internal observer evolve continuously.
+
+## 11. Data Flow Summary
+
+```text
+measured x, applied u
+  |
+  +-> internal observer RK4:
+      x_hat, w, eta, a_hat_internal, V_{e eta}, Q
+  |
+  +-> candidate radius:
+      z_theta^{e eta} = sqrt(2 * V_{e eta})
+      z_theta^E       = sqrt(2 * alpha * V_E(t_0))
+      r_candidate     = min(z_theta^{e eta}, z_theta^E)
+  |
+  +-> publish only if:
+      r_candidate <= radius_published - |a_hat_internal_next - a_hat_published|
+  |
+  +-> shield uses published:
+      (a_hat, radius)
 ```
 
-**Why it still failed**: the joint acceptance condition prevents the ball
-from "splitting" (bug 1), but it can't fix a bad radius estimate (bug 2).
-Example:
-
-```
-radius = 0.5, a_hat = 0, a_true = 0.4
-Observer produces a_tilde_est ≈ 0 (wrong!)  →  r_candidate = 0.01
-a_hat_candidate = 0.001, delta_a = 0.001
-accept = (0.01 <= 0.5 - 0.001) = True  ← passes!
-New: a_hat = 0.001, radius = 0.01
-But: |a_true - a_hat| = 0.399 >> 0.01  ← a_true is outside!
-```
-
-The acceptance condition passed because `delta_a` was tiny, but
-`r_candidate` was wrong — the point estimate underestimated by 40x.
-
-### v3: Lyapunov-Based Radius + Joint Acceptance (current)
-
-Replaces the heuristic point estimate with a **provably valid** Lyapunov
-energy bound from Adetola et al. 2009.
-
-```python
-# Lyapunov energy V_eη (eq 15b)
-V_eη_candidate = V_eη - gamma * ||innovation||² * dt
-r_candidate = sqrt(max(V_eη_candidate, 0))    # eq 15a: z_θ^eη = √V_eη
-
-# Joint acceptance (Algorithm 1)
-accept = (r_candidate <= radius - |delta_a|)
-a_hat_next   = a_hat_candidate  if accept  else a_hat
-radius_next  = r_candidate      if accept  else radius
-V_eη_next    = V_eη_candidate   if accept  else V_eη
-```
-
----
-
-## 8. Why the Lyapunov Radius Bound Works
-
-### The key identity
-
-In continuous time, the filter satisfies `e - eta = w * a_tilde` (from the
-observer ODEs, eqs 3-6 of the paper). Therefore:
-
-```
-||innovation||² = ||e - eta||² = ||w||² * a_tilde²
-```
-
-### Two Lyapunov functions decrease at the same rate
-
-Define `V_θ̃ = ½ a_tilde²` (the true estimation energy, not computable) and
-`V_eη` (computable, tracked in `info`):
-
-```
-V_θ̃_dot  = -a_tilde * a_hat_dot
-          = -a_tilde * gamma * w^T(e - eta)
-          = -gamma * a_tilde² * ||w||²
-
-V_eη_dot = -gamma * ||innovation||²
-         = -gamma * ||w||² * a_tilde²
-```
-
-They decrease at **exactly the same rate**.
-
-### The bound
-
-Since `V_θ̃(0) = ½ a_tilde(0)² ≤ ½ radius_0² = V_eη(0)` (by initialization),
-and both decrease at the same rate:
-
-```
-V_θ̃(t) ≤ V_eη(t)   for all t ≥ 0
-```
-
-Therefore:
-
-```
-½ (a_true - a_hat(t))² ≤ V_eη(t)
-|a_true - a_hat(t)| ≤ sqrt(2 * V_eη(t))
-```
-
-The radius `sqrt(2 * V_eη) + margin` is a valid upper bound on `|a_tilde|`.
-Unlike the heuristic point estimate, it **cannot underestimate** — it tracks
-the cumulative energy extracted from the innovation signal.
-
-### Why V_eη is frozen on rejection
-
-When the joint acceptance rejects an update, `a_hat` stays frozen, so
-`a_tilde` stays constant. But if we continued decreasing `V_eη`, it could
-drop below `V_θ̃`, breaking the bound. Freezing `V_eη` on rejection keeps
-it synchronized with the published `a_hat`.
-
-### Discretization
-
-In discrete time, V_θ̃ has an O(dt²) positive second-order term that V_eη
-doesn't, so V_θ̃ decreases slightly LESS than V_eη per step. This means
-V_eη decreases slightly faster → the bound `V_θ̃ ≤ V_eη` could eventually
-break. The additive `margin` parameter compensates for this discretization
-error.
-
----
-
-## 9. Guarantees
-
-**Invariant**: `a_true ∈ B(a_hat(t), radius(t))` for all `t >= 0`.
-
-Two-layer defense:
-
-1. **Lyapunov bound**: `radius ≥ sqrt(2 * V_eη) ≥ |a_tilde|`, so the
-   radius is always a valid bound on the estimation error (modulo small
-   discretization error covered by margin).
-
-2. **Joint acceptance**: `B(a_hat_new, r_new) ⊆ B(a_hat_old, r_old)`,
-   so the published ball only contracts. Even if the Lyapunov bound has
-   small discretization error, the acceptance condition provides an
-   additional geometric safety check.
-
----
-
-## 10. Data Flow Summary
-
-```
-x(t) (measured state)
-  │
-  ├─→ e = x - x_hat                    (prediction error)
-  ├─→ eta_next = eta * exp(-k*dt)       (transient decay)
-  ├─→ w_next = w*decay + Y(x)/k*(1-decay)  (filter update)
-  ├─→ x_hat_next = x_hat + (f + G@u + Y*a_hat + k*e)*dt  (predictor)
-  │
-  ├─→ innovation = e - eta
-  │     ├─→ a_hat_candidate = a_hat + gamma * w^T * innovation * dt
-  │     └─→ V_eη_candidate = V_eη - gamma * ||innovation||² * dt
-  │         r_candidate = sqrt(2 * V_eη_candidate) + margin
-  │
-  └─→ Joint acceptance: accept = (r_candidate <= radius - |delta_a|)
-        ├─→ YES: publish (a_hat_candidate, r_candidate, V_eη_candidate)
-        └─→ NO:  keep    (a_hat,           radius,      V_eη)
-                         │
-                         ▼
-              Shield uses B(a_hat, radius)
-              to compute CLF constraint:
-              LgV^T u <= -λV - LfV - LyV*a_hat - |LyV|*radius
-```
+That is the current estimator update path implemented in `adaptive.py`.

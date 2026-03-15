@@ -111,6 +111,7 @@ def episode_rollout(policy_params: Dict[str, Any],
             clf_cfg=clf_cfg,
             p=p,
             affine_terms_fn=acrobot_affine_terms,
+            input_bounds=(p.u_min, p.u_max),
         )
         u = jnp.clip(u_shield, -rollout_cfg.u_clip, rollout_cfg.u_clip)
 
